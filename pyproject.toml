@@ -1,0 +1,30 @@
+[project]
+name = "vault-mcp"
+version = "0.1.0"
+description = "MCP server for a personal Markdown knowledge vault"
+readme = "README.md"
+authors = [
+    { name = "Andrii Olkhovych", email = "andrii.olkhovych@tum.de" }
+]
+requires-python = ">=3.12"
+dependencies = [
+    "fastmcp==4.1.0",
+    "pyyaml>=6",
+]
+
+[project.scripts]
+vault-mcp = "vault_mcp.server:main"
+vault-lint = "vault_mcp.lint:main"
+
+[build-system]
+requires = ["uv_build>=0.11.18,<0.12.0"]
+build-backend = "uv_build"
+
+[dependency-groups]
+dev = [
+    "pytest>=9.1.1",
+    "pytest-asyncio>=1.4.0",
+]
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"

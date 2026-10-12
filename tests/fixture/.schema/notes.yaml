@@ -1,0 +1,42 @@
+# Frontmatter schema for notes/*.md and sources/*.md, enforced by scripts/lint.py.
+categories: [studies, careers, systems, agents, products, research, places,
+             experiences, wellness, gear, finances, administration, preferences]
+
+notes:
+  required: [kind, summary]
+  fields:
+    kind:       {enum: [fact, entity, synthesis, evergreen, reference, journal, index]}
+    status:     {enum: [unreviewed, confirmed, needs-update, outdated, historical], only_for: [fact]}
+    as_of:      {type: date}
+    reviewed:   {type: date}
+    categories: {type: list, items: category}
+    source:     {type: list, items: link, prefix: "sources/"}
+    about:      {type: list, items: link}
+    related:    {type: list, items: link}
+    supersedes: {type: list, items: link}
+    projects:   {type: list, items: link, prefix: "projects/"}
+    rating:     {type: int, min: 1, max: 7}
+    summary:    {type: str}
+    tags:       {type: list}
+    aliases:    {type: list}
+  rules:
+    - facts need status and as_of
+
+sources:
+  required: [kind, origin, source_kind, as_of, summary]
+  fields:
+    kind:        {enum: [source]}
+    origin:      {enum: [claude, chatgpt, hermes, manual, web]}
+    source_kind: {enum: [snapshot, chat-export, clipping, document, web-page]}
+    as_of:       {type: date}
+    categories:  {type: list, items: category}
+    summary:     {type: str}
+    url:         {type: str}
+
+projects:
+  required: [kind, summary]
+  fields:
+    kind:       {enum: [project]}
+    status:     {enum: [active, paused, done, dropped]}
+    categories: {type: list, items: category}
+    summary:    {type: str}
