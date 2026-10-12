@@ -67,7 +67,9 @@ def lint(vault: Vault, today: dt.date | None = None) -> dict[str, list[str]]:
     schema = yaml.safe_load((vault.root / ".schema/notes.yaml").read_text())
     notes = [p for p in vault.pages.values() if p.path.startswith("notes/")]
     superseded = vault.superseded_by()
-    backlinked = {t for p in vault.pages.values() for t in p.links if t != p.path}
+    # Lint reports link to everything they flag; counting those links would hide the findings.
+    linking = [p for p in vault.pages.values() if not p.path.startswith("notes/lint-")]
+    backlinked = {t for p in linking for t in p.links if t != p.path}
     entity_names = set()
     for p in notes:
         if p.kind == "entity":
@@ -119,8 +121,9 @@ def lint(vault: Vault, today: dt.date | None = None) -> dict[str, list[str]]:
 
 def render(report: dict[str, list[str]], today: dt.date) -> str:
     total = sum(len(v) for v in report.values())
-    lines = ["---", "kind: reference", f"as_of: {today}", "categories: [systems]",
-             f"summary: Lint report {today}: {total} findings.", "---", f"# Lint {today}", ""]
+    meta = {"kind": "reference", "as_of": today, "categories": ["systems"],
+            "summary": f"Lint report {today}: {total} findings."}
+    lines = ["---", yaml.safe_dump(meta, sort_keys=False).rstrip(), "---", f"# Lint {today}", ""]
     for section, items in report.items():
         lines.append(f"## {section} ({len(items)})")
         lines += [f"- {i}" for i in items] or ["- none"]

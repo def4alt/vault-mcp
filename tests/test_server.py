@@ -88,3 +88,19 @@ async def test_bearer_token_carries_required_scope():
     tok = await BearerVerifier("s3cret").verify_token("s3cret")
     assert tok is not None and "user" in tok.scopes
     assert await BearerVerifier("s3cret").verify_token("wrong") is None
+
+
+def test_lint_report_is_valid_and_does_not_hide_orphans(tmp_path):
+    import datetime as dt
+    from vault_mcp.lint import lint, render
+    from vault_mcp.vault import Vault, split_frontmatter
+    root = tmp_path / "v"
+    shutil.copytree(SKELETON, root)
+    (root / "notes/lonely.md").write_text("---\nkind: evergreen\nsummary: s\n---\n# Lonely\n")
+    today = dt.date(2026, 10, 12)
+    report = render(lint(Vault(root), today), today)
+    assert split_frontmatter(report)[0]["kind"] == "reference"
+    (root / "notes/lint-2026-10-12.md").write_text(report)
+    again = lint(Vault(root), today)
+    assert "[[notes/lonely]]" in again["Orphans"]
+    assert not again["Schema violations"]
