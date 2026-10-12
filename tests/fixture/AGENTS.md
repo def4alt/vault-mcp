@@ -45,6 +45,8 @@ summary: One line that states the claim or the point of the note.
 
 Sources have `kind: source`, `origin` (claude | chatgpt | hermes | manual | web), `source_kind` (snapshot | chat-export | clipping | document | web-page), `as_of`, `categories`, `summary`, and `url` when there is one.
 
+Projects have `kind: project`, `status` (active | exploring | paused | done | dropped), `area`, `review` (next review date) and `summary` (the next action).
+
 Don't store reverse relations (mentioned in, derived notes, superseded by, linked from). They come from backlinks.
 
 ## Ingest

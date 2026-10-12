@@ -16,6 +16,7 @@ notes:
     supersedes: {type: list, items: link}
     projects:   {type: list, items: link, prefix: "projects/"}
     rating:     {type: int, min: 1, max: 7}
+    url:        {type: str}
     summary:    {type: str}
     tags:       {type: list}
     aliases:    {type: list}
@@ -37,6 +38,8 @@ projects:
   required: [kind, summary]
   fields:
     kind:       {enum: [project]}
-    status:     {enum: [active, paused, done, dropped]}
+    status:     {enum: [active, exploring, paused, done, dropped]}
+    area:       {type: str}
+    review:     {type: date}
     categories: {type: list, items: category}
     summary:    {type: str}

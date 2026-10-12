@@ -19,6 +19,10 @@ STALE_DAYS = 90
 STOPWORDS = {"I", "My", "The", "A", "An", "In", "At", "On", "For", "And", "Or", "Of", "To", "As", "Is", "It", "From", "With", "Not"}
 
 
+def slug(text: str) -> str:
+    return re.sub(r"[^a-z0-9]+", "-", text.lower()).strip("-")
+
+
 def schema_errors(page: Page, schema: dict) -> list[str]:
     if page.meta.get("__invalid__"):
         return ["frontmatter is not valid YAML"]
@@ -64,7 +68,13 @@ def lint(vault: Vault, today: dt.date | None = None) -> dict[str, list[str]]:
     notes = [p for p in vault.pages.values() if p.path.startswith("notes/")]
     superseded = vault.superseded_by()
     backlinked = {t for p in vault.pages.values() for t in p.links if t != p.path}
-    entities = {p.path for p in notes if p.kind == "entity"}
+    entity_names = set()
+    for p in notes:
+        if p.kind == "entity":
+            words = re.findall(r"[A-Za-z0-9]+", p.title)
+            aliases = p.meta.get("aliases") or []
+            entity_names |= {p.path.split("/")[1], slug(p.title), slug("".join(w[0] for w in words))}
+            entity_names |= {slug(str(a)) for a in aliases}
 
     r: dict[str, list[str]] = {k: [] for k in (
         "Broken links", "Conflicts", "Superseded but not outdated", "Stale confirmed facts",
@@ -102,8 +112,7 @@ def lint(vault: Vault, today: dt.date | None = None) -> dict[str, list[str]]:
         if p.kind == "fact":
             names.update({w for w in re.findall(r"\b[A-Z][\w-]+(?: [A-Z][\w-]+)*", p.title) if w not in STOPWORDS})
     for name, n in names.most_common():
-        slug = re.sub(r"[^a-z0-9]+", "-", name.lower()).strip("-")
-        if n >= 3 and f"notes/{slug}" not in entities:
+        if n >= 3 and slug(name) not in entity_names:
             r["Missing entities"].append(f"{name} ({n} facts)")
     return r
 
