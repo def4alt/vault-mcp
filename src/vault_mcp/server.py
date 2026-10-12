@@ -49,7 +49,8 @@ class BearerVerifier(TokenVerifier):
     async def verify_token(self, token: str) -> AccessToken | None:
         if not hmac.compare_digest(token.encode(), self._token.encode()):
             return None
-        return AccessToken(token=token, client_id=BEARER_SUBJECT, scopes=[],
+        # Same scope the GitHub provider requires, otherwise MultiAuth answers 403.
+        return AccessToken(token=token, client_id=BEARER_SUBJECT, scopes=["user"],
                            subject=BEARER_SUBJECT, claims={"login": BEARER_SUBJECT})
 
 

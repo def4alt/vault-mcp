@@ -81,3 +81,10 @@ async def test_log_and_lint(server):
     assert "ingest [[sources/x]]: +1 fact (test)" in (root / "log.md").read_text()
     report = await call(mcp, "lint")
     assert "## Schema violations" in report
+
+
+async def test_bearer_token_carries_required_scope():
+    from vault_mcp.server import BearerVerifier
+    tok = await BearerVerifier("s3cret").verify_token("s3cret")
+    assert tok is not None and "user" in tok.scopes
+    assert await BearerVerifier("s3cret").verify_token("wrong") is None
