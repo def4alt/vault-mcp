@@ -16,10 +16,11 @@ from .widgets import widgets
 
 # Hosts may only read the first 512 characters: the essentials come first.
 INSTRUCTIONS = (
-    "Andrii's knowledge vault (Markdown + git) and his documents. Start with `search` (scope notes|sources|files|"
-    "documents, filters like tags or links_to), then `fetch` an id. Change things with `save` (many pages, one commit),"
-    " `move`, `delete`; every change is a commit you can `revert`. Files: `request_upload`, `save_from_url`, "
-    "`share_file`, `get_link`. Conventions: fetch('AGENTS'). Record work with `log`.\n\n"
+    "Andrii's knowledge vault (Markdown + git) and documents. Start with `search` (scopes notes|sources|files|"
+    "documents; filters like tags, links_to), then `fetch` an id. Change things with `save` (many pages, one commit),"
+    " `move`, `delete`; `revert` undoes any commit. Files: if you have a shell, move bytes yourself with curl via "
+    "`upload_link`/`get_link`; never paste file contents into tool calls. Else `save_from_url`, `share_file`, "
+    "`request_upload`. Conventions: fetch('AGENTS'). Record work with `log`.\n\n"
     "You are a trusted collaborator with broad write access, working alongside other agents (Claude, ChatGPT, "
     "Hermes) in the same vault. Capture what you learn, keep the graph tidy, describe and tag files you add, and "
     "check `history` before large changes. Hard limits: no secrets in the vault, sources stay as captured, "

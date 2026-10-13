@@ -36,24 +36,28 @@ def _signature(uri: str, expires: int, name: str = "") -> str:
     return base64.urlsafe_b64encode(digest).decode().rstrip("=")
 
 
-def _signed(uri: str, ttl: int | None, suffix: str = "", name: str | None = None) -> tuple[str, int]:
+def _signed(uri: str, ttl: int | None, base: str, suffix: str = "", name: str | None = None) -> tuple[str, int]:
     expires = int(time.time()) + (ttl or config.LINK_TTL)
     encoded_name = urllib.parse.quote(name, safe="") if name else ""  # nginx signs $arg_n as sent
     params = {"e": expires, "s": _signature(uri, expires, encoded_name)}
     query = urllib.parse.urlencode(params) + (f"&n={encoded_name}" if encoded_name else "")
-    return f"{config.FILES_BASE_URL}{urllib.parse.quote(uri)}{suffix}?{query}", expires
+    return f"{base}{urllib.parse.quote(uri)}{suffix}?{query}", expires
 
 
-def document_link(rel: str, ttl: int | None = None) -> tuple[str, int]:
-    return _signed("/d/" + rel.lstrip("/"), ttl)
+def document_link(rel: str, base: str, ttl: int | None = None) -> tuple[str, int]:
+    return _signed("/d/" + rel.lstrip("/"), ttl, base)
 
 
-def blob_link(blob: str, original_name: str, ttl: int | None = None) -> tuple[str, int]:
-    return _signed("/b/" + blob.removeprefix("blobs/"), ttl, name=original_name)
+def blob_link(blob: str, original_name: str, base: str, ttl: int | None = None) -> tuple[str, int]:
+    return _signed("/b/" + blob.removeprefix("blobs/"), ttl, base, name=original_name)
 
 
-def upload_link(upload_id: str, ttl: int | None = None) -> tuple[str, int]:
-    return _signed(f"/u/{upload_id}", ttl, suffix="/")
+def upload_links(upload_id: str, base: str, ttl: int | None = None) -> tuple[str, str, int]:
+    """(page URL for a person, PUT URL template with a {filename} placeholder, expiry).
+    Both share one signature over /u/<id>, so any file name can be PUT while the link is valid."""
+    page, expires = _signed(f"/u/{upload_id}", ttl, base, suffix="/")
+    path, query = page.split("?", 1)
+    return page, f"{path}{{filename}}?{query}", expires
 
 
 # --- the inbox: one directory per upload or fetch -----------------------------------

@@ -65,11 +65,14 @@ class History(BaseModel):
 class Link(BaseModel):
     url: str
     expires_at: str
+    curl: str = Field(description="Download command for an agent with a shell")
 
 
 class Upload(BaseModel):
-    id: str
-    url: str = Field(description="Upload page for Andrii; files PUT to it land in the vault")
+    id: str = Field(description="Pass to upload_status() after uploading")
+    page_url: str = Field(description="Upload page for a person (drag and drop)")
+    put_url_template: str = Field(description="PUT a file to this URL with {filename} replaced (URL-encoded)")
+    curl: str = Field(description="Upload command for an agent with a shell")
     expires_at: str
 
 

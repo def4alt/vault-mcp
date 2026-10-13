@@ -28,6 +28,8 @@ def index_path() -> Path:
 
 # Links (nginx verifies them) and limits
 FILES_BASE_URL = env("FILES_BASE_URL", "http://localhost:8080").rstrip("/")
+# The same nginx on the tailnet: no Cloudflare body limit, for agents with a shell on the tailnet (Hermes).
+FILES_TAILNET_BASE_URL = env("FILES_TAILNET_BASE_URL", "").rstrip("/")
 NOTES_BASE_URL = env("NOTES_BASE_URL", "http://localhost:3000").rstrip("/")  # SilverBullet, for citations
 LINK_SECRET = env("LINK_SECRET", "")
 LINK_TTL = int(env("LINK_TTL_SECONDS", "3600"))

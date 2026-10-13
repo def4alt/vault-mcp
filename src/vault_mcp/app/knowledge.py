@@ -18,7 +18,7 @@ from .. import config, documents, index, repo, rules, sharing
 from ..lint import lint as run_lint
 from ..lint import render as render_lint
 from ..vault import DATE_KEYS, PAGE_DIRS, Vault, render, split_frontmatter
-from .identity import author
+from .identity import author, files_base
 from .models import Change, CommitInfo, FetchedItem, History, Hit, SearchResults, WriteResult
 
 
@@ -40,7 +40,7 @@ def item_url(row) -> str | None:
     if row["scope"] == "vault":
         return page_url(row["id"])
     try:
-        return sharing.document_link(row["id"].removeprefix("doc:"), config.CITATION_TTL)[0]
+        return sharing.document_link(row["id"].removeprefix("doc:"), files_base(), config.CITATION_TTL)[0]
     except documents.DocumentError:
         return None
 
@@ -109,7 +109,7 @@ def fetch(id: str, offset: int = 0, limit: int = 20000) -> FetchedItem:
                 raise ToolError(f"no document `{item_id}`; closest: {', '.join(_closest(conn, item_id)) or 'none'}")
             sha = documents.sha256_of(p)
             text = documents.cached_text(sha) or documents.extract_text(p) or ""
-            title, url = p.name, sharing.document_link(documents.relative(p), config.CITATION_TTL)[0]
+            title, url = p.name, sharing.document_link(documents.relative(p), files_base(), config.CITATION_TTL)[0]
             meta = {"media": documents.media_of(p), "size": p.stat().st_size}
             if not text:
                 text = f"({meta['media']} file without extractable text; open it with the url)"
@@ -128,7 +128,7 @@ def fetch(id: str, offset: int = 0, limit: int = 20000) -> FetchedItem:
                 blob = config.VAULT_ROOT / str(fm["blob"])
                 if blob.exists():
                     name = str(fm.get("original_name") or blob.name)
-                    meta["download_url"] = sharing.blob_link(str(fm["blob"]), name)[0]
+                    meta["download_url"] = sharing.blob_link(str(fm["blob"]), name, files_base())[0]
                     extracted = documents.text_for(blob, str(fm.get("sha256") or documents.sha256_of(blob)))
                     if extracted:
                         text += "\n\n## Extracted text\n\n" + extracted

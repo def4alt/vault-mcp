@@ -45,10 +45,9 @@
   function put(file) {
     const state = row(file.name);
     if (file.size > MAX) { state.textContent = "too large, drop it into Agent/inbox instead"; state.className = "bad"; return; }
-    const [base, query] = upload.url.split("?");
     const name = file.name.replace(/[\/\\]/g, "-").replace(/^\.+/, "") || "file";
     const xhr = new XMLHttpRequest();
-    xhr.open("PUT", `${base}${encodeURIComponent(name)}?${query}`);
+    xhr.open("PUT", upload.put_url_template.replace("{filename}", encodeURIComponent(name)));
     xhr.upload.onprogress = (e) => { if (e.lengthComputable) state.textContent = `${Math.round(100 * e.loaded / e.total)}%`; };
     xhr.onload = () => {
       if (xhr.status < 300) { state.textContent = "filing…"; sent += 1; waitForFiling(); }
@@ -90,7 +89,7 @@
   });
   mcpApp.on("ui/notifications/tool-result", (result) => {
     upload = result.structuredContent;
-    if (!upload?.url) { $("purpose").textContent = "No upload link was created."; return; }
+    if (!upload?.put_url_template) { $("purpose").textContent = "No upload link was created."; return; }
     $("pick").disabled = false;
     $("purpose").textContent += ` · link valid until ${new Date(upload.expires_at).toLocaleTimeString()}`;
   });

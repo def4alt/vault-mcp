@@ -5,7 +5,9 @@ import datetime as dt
 import re
 
 from fastmcp import Context
-from fastmcp.server.dependencies import get_access_token
+from fastmcp.server.dependencies import get_access_token, get_http_request
+
+from .. import config
 
 BEARER_SUBJECT = "hermes"  # the claims login of the static bearer token
 
@@ -33,3 +35,14 @@ def author(ctx: Context | None) -> tuple[str, str]:
 
 def iso(ts: float) -> str:
     return dt.datetime.fromtimestamp(ts, dt.UTC).isoformat(timespec="seconds")
+
+
+def files_base() -> str:
+    """Base URL for file links: the tailnet host for callers on the tailnet, else the public one."""
+    try:
+        host = get_http_request().headers.get("host", "").split(":")[0]
+    except RuntimeError:  # no HTTP request (in-process clients)
+        host = ""
+    if config.FILES_TAILNET_BASE_URL and host in config.TAILNET_HOSTS:
+        return config.FILES_TAILNET_BASE_URL
+    return config.FILES_BASE_URL
