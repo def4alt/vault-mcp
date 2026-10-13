@@ -16,7 +16,8 @@ from .vault import Page, Vault, as_date
 
 STALE_DAYS = 90
 # Capitalised words that are sentence furniture, not names.
-STOPWORDS = {"I", "My", "The", "A", "An", "In", "At", "On", "For", "And", "Or", "Of", "To", "As", "Is", "It", "From", "With", "Not"}
+STOPWORDS = {"I", "My", "The", "A", "An", "In", "At", "On", "For", "And", "Or", "Of", "To", "As", "Is", "It",
+             "From", "With", "Not"}
 
 
 def slug(text: str) -> str:
@@ -101,7 +102,8 @@ def lint(vault: Vault, today: dt.date | None = None) -> dict[str, list[str]]:
             reviewed = as_date(p.meta.get("reviewed"))
             if reviewed is None or (today - reviewed).days > STALE_DAYS:
                 r["Stale confirmed facts"].append(f"[[{p.path}]] (reviewed {reviewed or 'never'})")
-        if (p.kind != "index" and not p.path.startswith("notes/lint-") and not p.field_links("about") and not p.field_links("related")
+        linked_out = p.field_links("about") or p.field_links("related")
+        if (p.kind != "index" and not p.path.startswith("notes/lint-") and not linked_out
                 and p.path not in backlinked):
             r["Orphans"].append(f"[[{p.path}]]")
 

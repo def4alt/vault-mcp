@@ -28,7 +28,8 @@ sources:
   fields:
     kind:        {enum: [source]}
     origin:      {enum: [claude, chatgpt, hermes, manual, web]}
-    source_kind: {enum: [snapshot, chat-export, clipping, document, web-page]}
+    source_kind: {enum: [snapshot, chat-export, clipping, document, web-page, video, audio, image, data]}
+    file:        {type: str}
     as_of:       {type: date}
     categories:  {type: list, items: category}
     summary:     {type: str}
