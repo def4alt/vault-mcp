@@ -1,13 +1,11 @@
 """Behaviour of the vault server, seen from its clients: tool calls, HTTP, files on disk and git."""
-import base64
-import datetime as dt
-import hashlib
+import functools
+import http.server
 import shutil
 import socket
 import subprocess
 import threading
 import time
-import urllib.parse
 import zipfile
 from pathlib import Path
 
@@ -15,14 +13,15 @@ import httpx2
 import pytest
 import uvicorn
 from fastmcp import Client
+from fastmcp.client.transports import StreamableHttpTransport
 from fastmcp.exceptions import ToolError
 
-from vault_mcp import config, worker
+from vault_mcp import config, incoming, signing, worker
 from vault_mcp.app.server import build
 
 SKELETON = Path(__file__).parent / "fixture"
 
-NOTE = """---
+FACT = """---
 kind: fact
 status: unreviewed
 as_of: 2026-10-12
@@ -32,6 +31,12 @@ about: ["[[notes/acme]]"]
 summary: I work at Acme.
 ---
 # I work at Acme
+"""
+ENTITY = """---
+kind: entity
+summary: Acme, a company.
+---
+# Acme
 """
 
 
@@ -47,25 +52,22 @@ def office(path: Path, parts: dict[str, str]) -> Path:
     return path
 
 
-def nginx_signature(expires: str, uri: str, name: str = "") -> str:
-    """What nginx computes for secure_link_md5 "$secure_link_expires$uri$arg_n $link_secret"."""
-    return base64.urlsafe_b64encode(hashlib.md5(f"{expires}{uri}{name} s3cret".encode()).digest()).decode().rstrip("=")
-
-
 @pytest.fixture
 def env(tmp_path, monkeypatch):
+    monkeypatch.setenv("GIT_CONFIG_GLOBAL", str(tmp_path / "gitconfig"))  # no signing or hooks from the host
+    monkeypatch.setenv("GIT_CONFIG_NOSYSTEM", "1")
     root = tmp_path / "vault"
     shutil.copytree(SKELETON, root)
     git(tmp_path, "init", "-q", "-b", "main", str(root))
     git(root, "add", "-A")
     git(root, "-c", "user.name=t", "-c", "user.email=t@t", "commit", "-qm", "seed")
     docs = tmp_path / "documents"
-    for d in ("Agent/inbox", "University", ".inbox"):
+    for d in ("Agent/inbox", "University"):
         (docs / d).mkdir(parents=True)
-    settings = {"VAULT_ROOT": root, "DOCS_ROOT": docs, "INBOX_ROOT": docs / ".inbox", "CACHE_ROOT": tmp_path / "cache",
-                "LINK_SECRET": "s3cret", "FILES_BASE_URL": "https://files.example",
-                "NOTES_BASE_URL": "https://notes.example", "GITHUB_CLIENT_ID": "", "BEARER_TOKEN": "",
-                "TAILNET_HOSTS": set(), "DROP_SETTLE_SECONDS": 0}
+    settings = {"VAULT_ROOT": root, "DOCS_ROOT": docs, "CACHE_ROOT": tmp_path / "cache", "LINK_SECRET": "s3cret",
+                "PUBLIC_URL": "https://vault.example", "NOTES_BASE_URL": "https://notes.example",
+                "GITHUB_CLIENT_ID": "", "API_KEYS": {}, "DROP_SETTLE_SECONDS": 0, "COMMIT_QUIET_SECONDS": 0,
+                "PUSH_INTERVAL": 0}
     for name, value in settings.items():
         monkeypatch.setattr(config, name, value)
     return root, docs
@@ -76,318 +78,274 @@ async def call(tool, **args):
         return (await c.call_tool(tool, args)).data
 
 
-async def save(path, content, message="edit: test"):
-    return await call("save", changes=[{"path": path, "content": content}], message=message)
+async def wire(tool, **args) -> dict:
+    """The JSON a client receives."""
+    async with Client(build()) as c:
+        return (await c.call_tool(tool, args)).structured_content
 
 
-# --- knowledge -------------------------------------------------------------------
+async def write(path, content, message="edit: test", **change):
+    return await call("write", changes=[{"path": path, "content": content, **change}], message=message)
 
-async def test_a_saved_fact_is_found_ranked_linked_and_attributed(env):
+
+async def rows(query, *params, **kw):
+    return (await call("sql", sql=query, params=list(params), **kw)).rows
+
+
+def commits(root) -> int:
+    return int(git(root, "rev-list", "--count", "HEAD"))
+
+
+# --- reading ---------------------------------------------------------------------------
+
+async def test_search_ranks_and_answers_in_the_shape_chatgpt_expects(env):
+    await write("notes/acme", ENTITY)
+    await write("notes/i-work-at-acme", FACT)
+    await write("notes/acme-history", ENTITY.replace("# Acme", "# Acme was founded in 1999").replace(
+        "kind: entity", "kind: evergreen"))
+    top = (await wire("search", query="work acme"))["results"][0]
+    assert set(top) == {"id", "title", "text", "url"} and "Acme" in top["text"]
+    assert top["id"] == "notes/i-work-at-acme" and top["url"] == "https://notes.example/notes/i-work-at-acme"
+    assert [r.id for r in (await call("search", query='"founded in 1999"')).results] == ["notes/acme-history"]
+
+
+async def test_fetch_reads_pages_old_versions_and_suggests_on_a_miss(env):
     root, _ = env
-    await save("notes/i-work-at-acme", NOTE, "ingest: test")
-    await save("notes/acme-history", NOTE.replace("I work at Acme", "Acme was founded in 1999")
-               .replace("kind: fact", "kind: evergreen").replace("status: unreviewed\n", ""))
-    hits = (await call("search", query="work acme")).results
-    assert hits[0].id == "notes/i-work-at-acme" and hits[0].url == "https://notes.example/notes/i-work-at-acme"
-    linked = (await call("search", filters={"links_to": "notes/acme"})).results
-    assert {h.id for h in linked} == {"notes/i-work-at-acme", "notes/acme-history"}
-    tagged = (await call("search", scope="notes", filters={"tags": "work", "status": "unreviewed"})).results
-    assert [h.id for h in tagged] == ["notes/i-work-at-acme"]
-    author, subject = git(root, "log", "-2", "--format=%an|%s").splitlines()[1].split("|")
-    assert author.startswith("vault-mcp (") and author != "vault-mcp (local)" and subject.startswith("ingest: test")
+    first = await write("notes/acme", ENTITY)
+    await write("notes/acme", ENTITY.replace("a company", "a company in Munich"))
+    page = await call("fetch", id="notes/acme")
+    assert "Munich" in page.text and page.metadata["rev"] == git(root, "hash-object", "notes/acme.md").strip()
+    assert "Munich" not in (await call("fetch", id=f"notes/acme@{first.commit}")).text
+    with pytest.raises(ToolError, match="closest: notes/acme"):
+        await call("fetch", id="notes/acme-inc")
 
 
-async def test_search_pages_with_a_cursor_and_offers_detail(env):
-    for i in range(5):
-        await save(f"notes/fact-{i}", NOTE.replace("I work at Acme", f"Fact number {i} about acme"))
-    first = await call("search", query="acme", limit=2)
-    second = await call("search", query="acme", limit=2, cursor=first.next_cursor)
-    assert len(first.results) == 2 and first.next_cursor
-    assert not {h.id for h in first.results} & {h.id for h in second.results}
-    detailed = (await call("search", query="acme", limit=1, response_format="detailed")).results[0]
-    assert detailed.status == "unreviewed" and detailed.tags == ["work"] and detailed.score is not None
-    assert (await call("search", query="number 3", mode="phrase")).results[0].id == "notes/fact-3"
-    assert (await call("search", query=r"number [34]\b", mode="regex")).results
+async def test_sql_answers_questions_about_links_tags_fields_and_history(env):
+    await write("notes/acme", ENTITY)
+    await write("notes/i-work-at-acme", FACT, "ingest: job")
+    assert await rows("SELECT src, field FROM links WHERE dst = ?", "notes/acme") == [
+        {"src": "notes/i-work-at-acme", "field": "about"}]
+    assert await rows("SELECT id FROM tags WHERE tag = 'work'") == [{"id": "notes/i-work-at-acme"}]
+    assert await rows("SELECT id FROM notes WHERE json_extract(fm, '$.categories[0]') = 'careers'") == [
+        {"id": "notes/i-work-at-acme"}]
+    history = await rows("SELECT f.id FROM commits c JOIN commit_files f USING (sha) WHERE c.message LIKE 'ingest%'")
+    assert history == [{"id": "notes/i-work-at-acme"}]
+    hits = await rows("SELECT id, snippet(fts, 3, '[', ']', '…', 8) AS s FROM fts WHERE fts MATCH 'work' "
+                      "ORDER BY bm25(fts)")
+    assert hits[0]["id"] == "notes/i-work-at-acme" and "[work]" in hits[0]["s"]
 
 
-async def test_edits_made_outside_the_server_are_searchable(env):
+async def test_sql_is_read_only_single_statement_and_bounded(env, monkeypatch):
+    for statement in ("INSERT INTO notes(id) VALUES ('x')", "DELETE FROM notes", "ATTACH 'x.db' AS x",
+                      "PRAGMA journal_mode = DELETE", "SELECT 1; SELECT 2"):
+        with pytest.raises(ToolError):
+            await call("sql", sql=statement)
+    monkeypatch.setattr(config, "SQL_TIMEOUT_SECONDS", 0.2)
+    with pytest.raises(ToolError, match="longer than"):
+        await call("sql", sql="WITH RECURSIVE n(i) AS (SELECT 1 UNION ALL SELECT i + 1 FROM n) SELECT max(i) FROM n")
+    for n in range(3):
+        await write(f"notes/thing-{n}", ENTITY.replace("# Acme", f"# Thing {n}"))
+    page = await call("sql", sql="SELECT id FROM notes ORDER BY id", limit=2)
+    assert page.truncated and [r["id"] for r in page.rows] == ["notes/thing-0", "notes/thing-1"]
+    rest = await call("sql", sql="SELECT id FROM notes ORDER BY id", limit=2, cursor=page.next_cursor)
+    assert not rest.truncated and [r["id"] for r in rest.rows] == ["notes/thing-2"]
+    clipped = (await rows("SELECT printf('%.5000c', 'x') AS long"))[0]["long"]
+    assert len(clipped) < 2200 and "substr" in clipped
+
+
+# --- writing ---------------------------------------------------------------------------
+
+async def test_a_batch_is_one_commit_or_nothing(env):
     root, _ = env
-    (root / "notes/typed-in-obsidian.md").write_text(NOTE.replace("I work at Acme", "Zanzibar trip planning"))
-    assert (await call("search", query="zanzibar")).results[0].id == "notes/typed-in-obsidian"
-    for suffix in ("", "-wal", "-shm"):  # the index is derived: losing it costs nothing
-        Path(f"{config.index_path()}{suffix}").unlink(missing_ok=True)
-    assert (await call("search", query="zanzibar")).results[0].id == "notes/typed-in-obsidian"
+    before = commits(root)
+    with pytest.raises(ToolError, match="credential"):
+        await call("write", message="ingest", changes=[
+            {"path": "notes/acme", "content": ENTITY},
+            {"path": "notes/leak", "content": ENTITY.replace("# Acme", "password: hunter2hunter2")}])
+    assert not (root / "notes/acme.md").exists() and commits(root) == before
+    result = await call("write", message="ingest", changes=[
+        {"path": "notes/acme", "content": ENTITY}, {"path": "notes/i-work-at-acme", "content": FACT}])
+    assert commits(root) == before + 1 and set(result.revs) == {"notes/acme.md", "notes/i-work-at-acme.md"}
 
 
-async def test_fetch_returns_text_backlinks_and_suggestions(env):
-    await save("notes/acme", "---\nkind: entity\ncategories: [careers]\nsummary: A company.\n---\n# Acme\n")
-    await save("notes/i-work-at-acme", NOTE)
-    item = await call("fetch", id="notes/acme")
-    assert item.title == "Acme" and item.metadata["backlinks"] == ["notes/i-work-at-acme"]
-    assert (await call("fetch", id="AGENTS")).text == (env[0] / "AGENTS.md").read_text()
-    with pytest.raises(ToolError, match="closest: notes/i-work-at-acme"):
-        await call("fetch", id="notes/work-acme")
-
-
-@pytest.mark.parametrize("path,content,reason", [
-    ("notes/x", NOTE + "\npassword: hunter2hunter2\n", "credential"),
-    ("notes/x", NOTE + "\nIBAN DE89 3704 0044 0532 0130 00\n", "IBAN"),
-    ("notes/x", NOTE.replace("careers", "hobbies"), "unknown category"),
-    ("notes/../.git/config", NOTE, "off limits"),
-    (".schema/notes", NOTE, "off limits"),
-])
-async def test_secrets_broken_frontmatter_and_git_internals_are_refused(env, path, content, reason):
-    with pytest.raises(ToolError, match=reason):
-        await save(path, content)
-
-
-async def test_agents_may_confirm_facts_and_improve_their_own_rules(env):
+async def test_base_rev_keeps_agents_from_overwriting_each_other(env):
     root, _ = env
-    await save("notes/x", NOTE)
-    await call("save", changes=[{"path": "notes/x", "frontmatter": {"set": {"status": "confirmed",
-                                                                            "reviewed": "2026-10-13"}}}],
-               message="review: Andrii confirmed")
-    await save("AGENTS", "# Rules\n\nImproved by an agent.\n", "edit: rules")
-    text = (root / "notes/x.md").read_text()
-    assert "status: confirmed" in text and "reviewed: 2026-10-13" in text and "# I work at Acme" in text
-    assert "Improved" in (root / "AGENTS.md").read_text()
+    rev = (await write("notes/acme", ENTITY, base_rev="new")).revs["notes/acme.md"]
+    (root / "notes/acme.md").write_text(ENTITY.replace("a company", "edited in Obsidian"))
+    with pytest.raises(ToolError, match="changed since you read it"):
+        await write("notes/acme", ENTITY.replace("a company", "my version"), base_rev=rev)
+    with pytest.raises(ToolError, match="changed since you read it"):
+        await write("notes/acme", ENTITY, base_rev="new")
+    fresh = (await call("fetch", id="notes/acme")).metadata["rev"]
+    await write("notes/acme", ENTITY.replace("a company", "merged"), base_rev=fresh)
+    assert "merged" in (root / "notes/acme.md").read_text()
+
+
+async def test_a_retried_write_is_applied_once(env):
+    root, _ = env
+    args = {"changes": [{"path": "notes/acme", "content": ENTITY}], "message": "add acme", "idempotency_key": "k-1"}
+    first = await call("write", **args)
+    (root / "notes/acme.md").write_text(ENTITY.replace("a company", "later edit"))
+    again = await call("write", **args)
+    assert again.replayed and again.commit == first.commit
+    assert "later edit" in (root / "notes/acme.md").read_text()
+
+
+async def test_move_rewrites_links_and_patches_touch_only_frontmatter(env):
+    root, _ = env
+    await write("notes/acme", ENTITY)
+    await write("notes/i-work-at-acme", FACT)
+    before = commits(root)
+    await call("write", message="rename", changes=[
+        {"path": "notes/acme", "move_to": "notes/acme-corp"},
+        {"path": "notes/i-work-at-acme", "frontmatter": {"set": {"status": "confirmed", "reviewed": "2026-10-13"}}}])
+    fact = (root / "notes/i-work-at-acme.md").read_text()
+    assert commits(root) == before + 1 and not (root / "notes/acme.md").exists()
+    assert "[[notes/acme-corp]]" in fact and "status: confirmed" in fact and fact.endswith("# I work at Acme\n")
 
 
 async def test_sources_stay_as_captured(env):
-    src = "---\nkind: source\norigin: manual\nsource_kind: document\nas_of: 2026-10-12\nsummary: s\n---\nraw\n"
-    await save("sources/raw-manual-2026-10-12", src)
-    with pytest.raises(ToolError, match="raw record"):
-        await save("sources/raw-manual-2026-10-12", src + "edit")
+    source = ("---\nkind: source\norigin: manual\nsource_kind: snapshot\nas_of: 2026-10-12\nsummary: s\n---\n"
+              "# Snapshot\n")
+    await write("sources/snap", source)
+    with pytest.raises(ToolError, match="stay as captured"):
+        await write("sources/snap", source.replace("Snapshot", "Rewritten"))
 
 
-async def test_a_save_is_one_commit_and_all_or_nothing(env):
+async def test_delete_removes_pages_and_only_files_nothing_refers_to(env):
     root, _ = env
-    commits = int(git(root, "rev-list", "--count", "HEAD"))
-    with pytest.raises(ToolError):
-        await call("save", message="batch", changes=[{"path": "notes/good", "content": NOTE},
-                                                     {"path": "notes/bad", "content": NOTE + "token: abcdefgh12"}])
-    assert not (root / "notes/good.md").exists()
-    await call("save", message="batch",
-               changes=[{"path": "notes/a", "content": NOTE}, {"path": "notes/b", "content": NOTE}])
-    await call("delete", paths=["notes/b"], message="cleanup")
-    assert (root / "notes/a.md").exists() and not (root / "notes/b.md").exists()
-    assert int(git(root, "rev-list", "--count", "HEAD")) == commits + 2
-    assert [h.id for h in (await call("search", query="acme", filters={"folder": "notes"})).results] == ["notes/a"]
+    first = await write("notes/acme", ENTITY)
+    await call("delete", paths=["notes/acme"], message="duplicate")
+    assert not (root / "notes/acme.md").exists()
+    assert "Acme" in (await call("fetch", id=f"notes/acme@{first.commit}")).text
+    (root / "blobs").mkdir(exist_ok=True)
+    (root / "blobs/0123456789abcdef.pdf").write_bytes(b"%PDF")
+    await call("delete", paths=["blobs/0123456789abcdef.pdf"], message="unused")
+    assert not (root / "blobs/0123456789abcdef.pdf").exists()
 
 
-async def test_moving_relinks_the_vault_and_revert_undoes_it(env):
+# --- files -----------------------------------------------------------------------------
+
+@pytest.fixture
+def server(env, monkeypatch):
+    """The real HTTP app, as Caddy proxies to it."""
+    with socket.socket() as s:
+        s.bind(("127.0.0.1", 0))
+        port = s.getsockname()[1]
+    monkeypatch.setattr(config, "PUBLIC_URL", f"http://127.0.0.1:{port}")
+    monkeypatch.setattr(config, "API_KEYS", {"hermes": "hermes-key"})
+    app = uvicorn.Server(uvicorn.Config(build().http_app(path="/mcp"), port=port, log_level="error"))
+    thread = threading.Thread(target=app.run, daemon=True)
+    thread.start()
+    while not app.started:
+        time.sleep(0.05)
+    yield config.PUBLIC_URL
+    app.should_exit = True
+    thread.join()
+
+
+def hermes(base):
+    return Client(StreamableHttpTransport(f"{base}/mcp", headers={"Authorization": "Bearer hermes-key"}))
+
+
+async def test_an_agent_with_a_shell_uploads_by_running_the_returned_curl(server, env, tmp_path):
     root, _ = env
-    await save("notes/acme", "---\nkind: entity\ncategories: [careers]\nsummary: A company.\n---\n# Acme\n")
-    await save("notes/fact", NOTE + "\nSee [[notes/acme|Acme]].\n")
-    await call("move", path="notes/acme", new_path="notes/acme-corp", message="rename")
-    text = (root / "notes/fact.md").read_text()
-    assert "[[notes/acme-corp]]" in text and "[[notes/acme-corp|Acme]]" in text
-    assert [h.id for h in (await call("search", filters={"links_to": "notes/acme-corp"})).results] == ["notes/fact"]
-    latest = (await call("history", limit=1)).commits[0]
-    assert latest.message.startswith("rename")
-    await call("revert", commit=latest.sha)
-    assert (root / "notes/acme.md").exists() and "[[notes/acme|Acme]]" in (root / "notes/fact.md").read_text()
+    async with hermes(server) as c:
+        ticket = (await c.call_tool("upload", {"filename": "report.txt", "purpose": "Q3 numbers",
+                                               "tags": ["finance"]})).data
+    (tmp_path / "report.txt").write_text("revenue went up")
+    out = subprocess.run(ticket.curl, shell=True, cwd=tmp_path, capture_output=True, text=True, check=True).stdout
+    assert '"note":"files/report"' in out.replace(" ", "")
+    note = (root / "files/report.md").read_text()
+    assert "origin: hermes" in note and "Q3 numbers" in note and "- finance" in note
+    assert git(root, "ls-files", "blobs") == "" and "files/report.md" in git(root, "ls-files", "files")
+    again = httpx2.put(ticket.put_url.replace("{filename}", "copy.txt"), content=b"revenue went up")
+    assert again.status_code == 200 and again.json() == {"note": "files/report", "duplicate": True}
+    forged = ticket.put_url.replace("{filename}", "x.txt").replace("s=", "s=A")
+    assert httpx2.put(forged, content=b"x").status_code == 403
 
 
-async def test_the_log_names_the_agent_and_lint_reports_health(env):
-    root, _ = env
-    await call("log", op="ingest", target="[[sources/x]]", what="+1 fact")
-    line = (root / "log.md").read_text().strip().splitlines()[-1]
-    assert "ingest [[sources/x]]: +1 fact (" in line and "(local)" not in line
-    assert "## Schema violations (0)" in await call("lint")
+async def test_downloads_are_checked_for_caddy_before_it_serves_them(server, env):
+    _, docs = env
+    (docs / "University/plan.pdf").write_bytes(b"%PDF")
+
+    def check(url, method="GET"):
+        headers = {"X-Forwarded-Uri": url.removeprefix(server), "X-Forwarded-Method": method}
+        return httpx2.get(f"{server}/_verify", headers=headers).status_code
+
+    blob = signing.blob_link("blobs/0123456789abcdef.pdf", "Plan v2.pdf")
+    assert check(blob) == 200 and check(signing.document_link("University/plan.pdf")) == 200
+    assert check(blob.replace("0123456789abcdef", "fedcba9876543210")) == 403
+    assert check(signing.blob_link("blobs/0123456789abcdef.pdf", "x", ttl=-10)) == 410
+    assert check(blob, "POST") == 405
+    assert check(signing.document_link("University/plan.pdf").replace("University", ".git")) == 403
+    with pytest.raises(ValueError):
+        signing.document_link(".incoming/x")
 
 
-def test_saved_lint_reports_are_valid_and_do_not_hide_orphans(env):
-    from vault_mcp.lint import lint, render
-    from vault_mcp.vault import Vault, split_frontmatter
-    root, _ = env
-    (root / "notes/lonely.md").write_text("---\nkind: evergreen\nsummary: s\n---\n# Lonely\n")
-    today = dt.date(2026, 10, 12)
-    report = render(lint(Vault(root), today), today)
-    assert split_frontmatter(report)[0]["kind"] == "reference"
-    (root / "notes/lint-2026-10-12.md").write_text(report)
-    again = lint(Vault(root), today)
-    assert "[[notes/lonely]]" in again["Orphans"] and not again["Schema violations"]
+async def test_urls_and_chatgpt_attachments_are_pulled_by_the_server(env, tmp_path, monkeypatch):
+    with pytest.raises(ToolError, match="non-public"):
+        await call("upload", url="http://127.0.0.1:1/secret")
+    (tmp_path / "www").mkdir()
+    (tmp_path / "www/paper.pdf").write_bytes(b"%PDF-1.4 attention")
+    handler = functools.partial(http.server.SimpleHTTPRequestHandler, directory=str(tmp_path / "www"))
+    httpd = http.server.ThreadingHTTPServer(("127.0.0.1", 0), handler)
+    threading.Thread(target=httpd.serve_forever, daemon=True).start()
+    monkeypatch.setattr(incoming, "_check_public", lambda url: None)  # stand-in for a public host
+    try:
+        url = f"http://127.0.0.1:{httpd.server_port}/paper.pdf"
+        filed = await call("upload", url=url, purpose="the paper")
+        assert filed.note == "files/paper" and not filed.duplicate
+        attached = await call("upload", file={"download_url": url, "file_id": "f1", "file_name": "Paper.pdf"})
+        assert attached.duplicate and attached.note == "files/paper"
+    finally:
+        httpd.shutdown()
+    files = await rows("SELECT id, name, mime, url FROM files")
+    assert files[0]["mime"] == "application/pdf" and files[0]["url"].startswith("https://vault.example/f/")
 
 
-async def test_reviewing_lists_unreviewed_facts_and_records_decisions(env):
-    root, _ = env
-    await save("notes/old-fact", NOTE.replace("as_of: 2026-10-12", "as_of: 2025-01-01"))
-    await save("notes/new-fact", NOTE)
-    async with Client(build()) as c:
-        result = await c.call_tool("review_queue", {})
-    queue = result.structured_content
-    assert [i["id"] for i in queue["items"]] == ["notes/old-fact", "notes/new-fact"]
-    assert "2 unreviewed facts" in result.content[0].text
-    # what the widget sends when Andrii clicks Confirm
-    await call("save", changes=[{"path": "notes/old-fact", "frontmatter": {"set": {"status": "confirmed",
-                                                                                     "reviewed": "2026-10-13"}}}],
-               message="review: confirmed notes/old-fact (review app)")
-    async with Client(build()) as c:
-        left = (await c.call_tool("review_queue", {})).structured_content["items"]
-    assert [i["id"] for i in left] == ["notes/new-fact"]
-
-
-# --- files ---------------------------------------------------------------------
-
-async def test_uploads_become_file_notes_with_blobs(env):
-    root, _ = env
-    async with Client(build()) as c:
-        result = await c.call_tool("request_upload", {"purpose": "Robot Vision slides", "tags": ["snu", "slides"]})
-    upload = result.structured_content
-    assert upload["page_url"] in result.content[0].text  # hosts without MCP Apps still get the link
-    # nginx writes the PUT body into the upload's inbox directory
-    office(config.INBOX_ROOT / upload["id"] / "Deck 1.pptx",
-           {"ppt/slides/slide1.xml": "<a:p><a:t>Depth ablation</a:t></a:p>"})
-    worker.run_once()
-
-    status = await call("upload_status", id=upload["id"])
-    filed = status.filed[0]
-    assert filed.note == "files/deck-1" and filed.blob.startswith("blobs/") and filed.blob.endswith(".pptx")
-    assert (root / filed.blob).exists() and not status.waiting
-    tracked = git(root, "ls-files").split()
-    assert "files/deck-1.md" in tracked and filed.blob not in tracked  # the note is versioned, the bytes are not
-    note = await call("fetch", id="files/deck-1")
-    assert note.metadata["tags"] == ["slides", "snu"] and note.metadata["summary"] == "Robot Vision slides"
-    assert "Depth ablation" in note.text and note.metadata["download_url"].startswith("https://files.example/b/")
-    assert (await call("search", query="depth ablation", scope="files")).results[0].id == "files/deck-1"
-
-    again = await call("request_upload", purpose="same deck")
-    shutil.copy(root / filed.blob, config.INBOX_ROOT / again.id / "copy.pptx")
-    worker.run_once()
-    assert (await call("upload_status", id=again.id)).filed[0].duplicate is True
-    assert len(list((root / "files").glob("*.md"))) == 1
-
-
-async def test_an_agent_with_a_shell_uploads_by_itself(env):
-    root, _ = env
-    link = await call("upload_link", purpose="Generated report", tags=["report"], filename="Q3 report.pdf")
-    put = link.put_url_template.replace("{filename}", "Q3%20report.pdf")
-    parts = urllib.parse.urlsplit(put)
-    q = dict(urllib.parse.parse_qsl(parts.query))
-    assert q["s"] == nginx_signature(q["e"], f"/u/{link.id}")  # nginx accepts this PUT
-    assert put in link.curl and link.curl.startswith("curl -fsS -T ")
-    # what nginx does with the PUT
-    target = config.INBOX_ROOT / link.id / urllib.parse.unquote(parts.path.rsplit("/", 1)[1])
-    target.write_bytes(b"generated by an agent")
-    worker.run_once()
-    filed = (await call("upload_status", id=link.id)).filed[0]
-    assert filed.note == "files/q3-report" and "tags:\n- report" in (root / "files/q3-report.md").read_text()
-    download = await call("get_link", id="files/q3-report")
-    assert download.curl == f"curl -fsSL -o 'Q3 report.pdf' '{download.url}'"
-
-
-async def test_files_dropped_into_the_drop_folder_are_filed(env):
+async def test_the_worker_files_drops_commits_outside_edits_and_reports_problems(env):
     root, docs = env
-    (docs / "Agent/inbox/meeting notes.txt").write_text("Quarterly planning with the robotics team")
+    (docs / "Agent/inbox/deck.pptx").write_bytes(b"PK slides")
+    (root / "notes/typed-in-obsidian.md").write_text(ENTITY.replace("# Acme", "# Typed\n\nSee [[notes/nowhere]]"))
+    (root / "notes/acme.sync-conflict-20261013-ABC.md").write_text("conflict copy")
     worker.run_once()
-    assert not (docs / "Agent/inbox/meeting notes.txt").exists()
-    hit = (await call("search", query="robotics planning")).results[0]
-    assert hit.id == "files/meeting-notes" and "origin: manual" in (root / "files/meeting-notes.md").read_text()
+    assert not (docs / "Agent/inbox/deck.pptx").exists()
+    deck = await rows("SELECT mime FROM files WHERE name = 'deck.pptx'")
+    assert deck == [{"mime": "application/vnd.openxmlformats-officedocument.presentationml.presentation"}]
+    assert "autocommit" in git(root, "log", "-1", "--format=%s", "--", "notes/typed-in-obsidian.md")
+    assert "sync-conflict" not in git(root, "ls-files")
+    problems = await rows("SELECT kind, id FROM problems WHERE kind IN ('broken-link', 'sync-conflict') ORDER BY kind")
+    assert problems == [{"kind": "broken-link", "id": "notes/typed-in-obsidian"},
+                        {"kind": "sync-conflict", "id": "notes/acme.sync-conflict-20261013-ABC.md"}]
 
 
-async def test_download_links_verify_like_nginx(env):
-    root, docs = env
-    (docs / "University/Lecture 1.pdf").write_bytes(b"%PDF")
-    doc = await call("get_link", id="doc:University/Lecture 1.pdf", minutes=5)
-    parts = urllib.parse.urlsplit(doc.url)
-    q = dict(urllib.parse.parse_qsl(parts.query))
-    assert urllib.parse.unquote(parts.path) == "/d/University/Lecture 1.pdf"
-    assert q["s"] == nginx_signature(q["e"], "/d/University/Lecture 1.pdf") and 0 < int(q["e"]) - time.time() <= 300
-
-    (docs / "Agent/inbox/Plan v2.txt").write_text("plan")
-    worker.run_once()
-    blob = await call("get_link", id="files/plan-v2")
-    parts = urllib.parse.urlsplit(blob.url)
-    raw_name = parts.query.split("&n=")[1]  # nginx signs $arg_n exactly as sent
-    q = dict(urllib.parse.parse_qsl(parts.query))
-    assert parts.path.startswith("/b/") and urllib.parse.unquote(raw_name) == "Plan v2.txt"
-    assert q["s"] == nginx_signature(q["e"], parts.path, raw_name)
-
-
-async def test_documents_are_searchable_and_readable(env):
+async def test_documents_are_searchable_readable_and_confined(env):
     _, docs = env
     office(docs / "University/lecture.docx",
            {"word/document.xml": "<w:p><w:t>Population coding &amp; noise</w:t></w:p>"})
     worker.run_once()
-    hit = (await call("search", query="population coding", scope="documents")).results[0]
-    assert hit.id == "doc:University/lecture.docx" and hit.url.startswith("https://files.example/d/")
+    hit = (await call("search", query="population coding")).results[0]
+    assert hit.id == "doc:University/lecture.docx" and hit.url.startswith("https://vault.example/d/University/")
     assert "Population coding & noise" in (await call("fetch", id=hit.id)).text
-    listing = (await call("search", scope="documents", filters={"folder": "University"})).results
-    assert [h.id for h in listing] == ["doc:University/lecture.docx"]
-
-
-async def test_hidden_paths_escapes_and_internal_urls_are_refused(env):
-    for item in ("doc:../vault/AGENTS.md", "doc:.inbox/x"):
+    for item in ("doc:../vault/AGENTS.md", "doc:.stversions/x", ".git/config"):
         with pytest.raises(ToolError):
             await call("fetch", id=item)
-    with pytest.raises(ToolError, match="non-public"):
-        await call("save_from_url", url="http://127.0.0.1:1/secret", purpose="probe")
 
 
-async def test_lint_notices_blobs_without_notes(env):
-    root, _ = env
-    (root / "blobs").mkdir(exist_ok=True)
-    (root / "blobs/0123456789abcdef.pdf").write_bytes(b"%PDF")
-    assert "blobs/0123456789abcdef.pdf` has no file note" in await call("lint")
-
-
-async def test_widgets_are_served_as_mcp_apps(env):
-    async with Client(build()) as c:
-        for uri in ("ui://vault/upload.html", "ui://vault/review.html"):
-            content = (await c.read_resource(uri))[0]
-            assert content.mime_type == "text/html;profile=mcp-app"
-            assert "ui/initialize" in content.text and "/*BRIDGE*/" not in content.text
-
-
-# --- access ------------------------------------------------------------------------
-
-@pytest.fixture
-def http_server(env, monkeypatch):
-    monkeypatch.setattr(config, "BEARER_TOKEN", "hermes-token")
-    monkeypatch.setattr(config, "TAILNET_HOSTS", {"vault.tailnet"})
-    with socket.socket() as s:
-        s.bind(("127.0.0.1", 0))
-        port = s.getsockname()[1]
-    server = uvicorn.Server(uvicorn.Config(build().http_app(path="/mcp"), port=port, log_level="error"))
-    thread = threading.Thread(target=server.run, daemon=True)
-    thread.start()
-    while not server.started:
-        time.sleep(0.05)
-    yield f"http://127.0.0.1:{port}/mcp"
-    server.should_exit = True
-    thread.join()
-
+# --- access ----------------------------------------------------------------------------
 
 INIT = {"jsonrpc": "2.0", "id": 1, "method": "initialize",
-        "params": {"protocolVersion": "2025-06-18", "capabilities": {},
-                   "clientInfo": {"name": "mcp", "version": "1"}}}
+        "params": {"protocolVersion": "2025-06-18", "capabilities": {}, "clientInfo": {"name": "t", "version": "1"}}}
 
 
-def test_hermes_token_works_only_on_the_tailnet_host(http_server):
-    def post(host, token=None):
-        headers = {"Host": host, "Accept": "application/json, text/event-stream"}
+def test_only_known_api_keys_get_in(server):
+    def post(token=None):
+        headers = {"Accept": "application/json, text/event-stream"}
         if token:
             headers["Authorization"] = f"Bearer {token}"
-        return httpx2.post(http_server, json=INIT, headers=headers, timeout=10)
+        return httpx2.post(f"{server}/mcp", json=INIT, headers=headers, timeout=10)
 
-    assert post("vault.tailnet").status_code == 401
-    assert post("vault.tailnet", "wrong").status_code == 401
-    ok = post("vault.tailnet", "hermes-token")
+    assert post().status_code == 401 and post("wrong").status_code == 401
+    ok = post("hermes-key")
     assert ok.status_code == 200 and '"serverInfo"' in ok.text
-    public = post("mcp.public", "hermes-token")
-    assert "only accepted on the tailnet hostname" in public.text and '"serverInfo"' not in public.text
-
-
-async def test_hermes_gets_tailnet_links_and_attribution(http_server, env, monkeypatch):
-    from fastmcp.client.transports import StreamableHttpTransport
-    root, _ = env
-    monkeypatch.setattr(config, "FILES_TAILNET_BASE_URL", "https://files.tailnet")
-    transport = StreamableHttpTransport(http_server, headers={"Host": "vault.tailnet",
-                                                              "Authorization": "Bearer hermes-token"})
-    async with Client(transport) as c:
-        link = (await c.call_tool("upload_link", {"purpose": "from hermes", "filename": "report.txt"})).data
-    assert link.put_url_template.startswith("https://files.tailnet/u/hermes-")  # no Cloudflare upload cap
-    (config.INBOX_ROOT / link.id / "report.txt").write_text("hermes made this")
-    worker.run_once()
-    assert "origin: hermes" in (root / "files/report.md").read_text()

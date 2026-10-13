@@ -1,6 +1,8 @@
 """Vault lint: the checks from AGENTS.md, as a report.
 
-    vault-lint <vault-root> [--write]
+    vault-lint <vault-root>
+
+The worker keeps the same findings in the index's `problems` table for agents.
 """
 from __future__ import annotations
 
@@ -9,6 +11,7 @@ import datetime as dt
 import re
 from collections import Counter
 from pathlib import Path
+from typing import NamedTuple
 
 import yaml
 
@@ -68,14 +71,19 @@ def schema_errors(page: Page, schema: dict) -> list[str]:
     return errors
 
 
-def lint(vault: Vault, today: dt.date | None = None) -> dict[str, list[str]]:
+class Problem(NamedTuple):
+    # broken-link, conflict, superseded, stale, orphan, undistilled, missing-entity, schema, blob, sync-conflict
+    kind: str
+    id: str  # the page (or blob, or entity name) the problem is about
+    detail: str
+
+
+def lint(vault: Vault, today: dt.date | None = None) -> list[Problem]:
     today = today or dt.date.today()
     schema = yaml.safe_load((vault.root / ".schema/notes.yaml").read_text())
     notes = [p for p in vault.pages.values() if p.path.startswith("notes/")]
     superseded = vault.superseded_by()
-    # Lint reports link to everything they flag; counting those links would hide the findings.
-    linking = [p for p in vault.pages.values() if not p.path.startswith("notes/lint-")]
-    backlinked = {t for p in linking for t in p.links if t != p.path}
+    backlinked = {t for p in vault.pages.values() for t in p.links if t != p.path}
     entity_names = set()
     for p in notes:
         if p.kind == "entity":
@@ -83,49 +91,48 @@ def lint(vault: Vault, today: dt.date | None = None) -> dict[str, list[str]]:
             aliases = p.meta.get("aliases") or []
             entity_names |= {p.path.split("/")[1], slug(p.title), slug("".join(w[0] for w in words))}
             entity_names |= {slug(str(a)) for a in aliases}
-
-    r: dict[str, list[str]] = {k: [] for k in (
-        "Broken links", "Conflicts", "Superseded but not outdated", "Stale confirmed facts",
-        "Orphans", "Undistilled sources", "Missing entities", "Schema violations", "Blobs")}
+    out: list[Problem] = []
 
     for p in vault.pages.values():
         for t in sorted(p.links | p.embeds):
             if not vault.exists(t):
-                r["Broken links"].append(f"[[{p.path}]] → `{t}`")
-        for e in schema_errors(p, schema):
-            r["Schema violations"].append(f"[[{p.path}]]: {e}")
+                out.append(Problem("broken-link", p.path, f"links to `{t}`, which does not exist"))
+        out += [Problem("schema", p.path, e) for e in schema_errors(p, schema)]
 
     for p in notes:
         status = p.meta.get("status")
         if status == "needs-update":
-            r["Conflicts"].append(f"[[{p.path}]]: {p.meta.get('summary', '')}")
+            out.append(Problem("conflict", p.path, str(p.meta.get("summary", ""))))
         newer = superseded.get(p.path, [])
         if newer and status not in ("outdated", "historical"):
-            r["Superseded but not outdated"].append(
-                f"[[{p.path}]] ({status}) superseded by " + ", ".join(f"[[{n}]]" for n in newer))
+            out.append(Problem("superseded", p.path, f"status {status}, superseded by {', '.join(newer)}"))
         if p.kind == "fact" and status == "confirmed":
             reviewed = as_date(p.meta.get("reviewed"))
             if reviewed is None or (today - reviewed).days > STALE_DAYS:
-                r["Stale confirmed facts"].append(f"[[{p.path}]] (reviewed {reviewed or 'never'})")
+                out.append(Problem("stale", p.path, f"confirmed, last reviewed {reviewed or 'never'}"))
         linked_out = p.field_links("about") or p.field_links("related")
-        if (p.kind != "index" and not p.path.startswith("notes/lint-") and not linked_out
-                and p.path not in backlinked):
-            r["Orphans"].append(f"[[{p.path}]]")
+        if p.kind != "index" and not linked_out and p.path not in backlinked:
+            out.append(Problem("orphan", p.path, "nothing links here and it links to nothing via about/related"))
 
     for p in vault.pages.values():
         if p.path.startswith(("sources/", "files/")) and p.path not in backlinked:
-            r["Undistilled sources"].append(f"[[{p.path}]]")
+            out.append(Problem("undistilled", p.path, "no note cites it yet"))
 
     referenced = set()
     for p in vault.pages.values():
         if p.path.startswith("files/") and p.meta.get("blob"):
             referenced.add(str(p.meta["blob"]))
             if not (vault.root / str(p.meta["blob"])).exists():
-                r["Blobs"].append(f"[[{p.path}]]: its blob `{p.meta['blob']}` is missing")
+                out.append(Problem("blob", p.path, f"its blob `{p.meta['blob']}` is missing"))
     blob_dir = vault.root / "blobs"
     for f in sorted(blob_dir.iterdir()) if blob_dir.is_dir() else []:
         if not f.name.startswith(".") and f"blobs/{f.name}" not in referenced:
-            r["Blobs"].append(f"`blobs/{f.name}` has no file note (write one, or delete the blob)")
+            out.append(Problem("blob", f"blobs/{f.name}", "no file note describes it (write one, or delete the blob)"))
+
+    for f in sorted(vault.root.rglob("*.sync-conflict-*")):
+        if ".git" not in f.parts:
+            rel = str(f.relative_to(vault.root))
+            out.append(Problem("sync-conflict", rel, "Syncthing conflict copy: merge it into the original, delete it"))
 
     names: Counter[str] = Counter()
     for p in notes:
@@ -133,18 +140,16 @@ def lint(vault: Vault, today: dt.date | None = None) -> dict[str, list[str]]:
             names.update({w for w in re.findall(r"\b[A-Z][\w-]+(?: [A-Z][\w-]+)*", p.title) if w not in STOPWORDS})
     for name, n in names.most_common():
         if n >= 3 and slug(name) not in entity_names:
-            r["Missing entities"].append(f"{name} ({n} facts)")
-    return r
+            out.append(Problem("missing-entity", name, f"named in {n} facts but has no entity note"))
+    return out
 
 
-def render(report: dict[str, list[str]], today: dt.date) -> str:
-    total = sum(len(v) for v in report.values())
-    meta = {"kind": "reference", "as_of": today, "categories": ["systems"],
-            "summary": f"Lint report {today}: {total} findings."}
-    lines = ["---", yaml.safe_dump(meta, sort_keys=False).rstrip(), "---", f"# Lint {today}", ""]
-    for section, items in report.items():
-        lines.append(f"## {section} ({len(items)})")
-        lines += [f"- {i}" for i in items] or ["- none"]
+def render(problems: list[Problem], today: dt.date) -> str:
+    lines = [f"# Lint {today}: {len(problems)} problems", ""]
+    for kind in dict.fromkeys(p.kind for p in problems):
+        group = [p for p in problems if p.kind == kind]
+        lines.append(f"## {kind} ({len(group)})")
+        lines += [f"- {p.id}: {p.detail}" for p in group]
         lines.append("")
     return "\n".join(lines)
 
@@ -152,13 +157,9 @@ def render(report: dict[str, list[str]], today: dt.date) -> str:
 def main() -> None:
     ap = argparse.ArgumentParser()
     ap.add_argument("root", type=Path)
-    ap.add_argument("--write", action="store_true", help="write notes/lint-YYYY-MM-DD.md")
     args = ap.parse_args()
     today = dt.date.today()
-    text = render(lint(Vault(args.root), today), today)
-    if args.write:
-        (args.root / f"notes/lint-{today}.md").write_text(text)
-    print(text)
+    print(render(lint(Vault(args.root), today), today))
 
 
 if __name__ == "__main__":

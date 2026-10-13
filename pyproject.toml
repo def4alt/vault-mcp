@@ -1,6 +1,6 @@
 [project]
 name = "vault-mcp"
-version = "0.3.1"
+version = "0.4.0"
 description = "MCP server for a personal Markdown knowledge vault"
 readme = "README.md"
 authors = [
@@ -8,6 +8,7 @@ authors = [
 ]
 requires-python = ">=3.12"
 dependencies = [
+    "anyio>=4",
     "fastmcp==4.1.0",
     "prometheus-client>=0.21",
     "pyyaml>=6",

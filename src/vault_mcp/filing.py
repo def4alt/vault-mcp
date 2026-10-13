@@ -3,7 +3,7 @@
     blobs/<sha256[:16]>.<ext>   the bytes, named by content, never renamed (not in git)
     files/<slug>.md             frontmatter (tags, categories, about, related...) + summary + embed
 
-Uploads, URL fetches, ChatGPT attachments and the Syncthing drop folder all go through file().
+Uploads (signed PUTs), URL fetches, ChatGPT attachments and the drop folder all go through file().
 """
 from __future__ import annotations
 
@@ -15,6 +15,15 @@ from pathlib import Path
 
 from . import config, documents, index, repo, rules
 from .vault import render, slugify, split_frontmatter, unique_path
+
+
+def origin_of(client: str) -> str:
+    """Which agent family a client name belongs to (claude-ai, openai-mcp, hermes...)."""
+    c = client.lower()
+    for key, origin in (("claude", "claude"), ("chatgpt", "chatgpt"), ("openai", "chatgpt"), ("hermes", "hermes")):
+        if key in c:
+            return origin
+    return "manual"
 
 
 def note_for_hash(sha: str) -> str | None:
@@ -38,7 +47,7 @@ def store_blob(src: Path, sha: str, name: str) -> str:
     for length in (16, 32, 64):  # a longer name only if a 64-bit prefix ever collides
         dest = root / f"{sha[:length]}{_extension(name)}"
         if not dest.exists():
-            shutil.move(src, dest)  # copy + delete across mounts, rename within one
+            shutil.move(src, dest)  # a rename: incoming files live on the same mount
             os.chmod(dest, 0o664)
             return f"blobs/{dest.name}"
         if documents.sha256_of(dest) == sha:

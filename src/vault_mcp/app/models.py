@@ -1,4 +1,7 @@
-"""Typed tool results; FastMCP publishes them as output schemas."""
+"""Typed tool results; FastMCP publishes them as output schemas.
+
+search and fetch follow the shapes ChatGPT's deep research and company knowledge expect.
+"""
 from __future__ import annotations
 
 from typing import Any
@@ -6,32 +9,33 @@ from typing import Any
 from pydantic import BaseModel, Field
 
 
-class Hit(BaseModel):
-    id: str = Field(description="Pass to fetch(). Vault pages: notes/x, files/x...; documents: doc:<path>")
+class SearchResult(BaseModel):
+    id: str = Field(description="Pass to fetch(). Pages: notes/x, files/x...; documents: doc:<path>")
     title: str
-    url: str | None = Field(None, description="Where Andrii can open it (cite this)")
-    kind: str | None = None
-    snippet: str | None = None
-    status: str | None = None
-    as_of: str | None = None
-    summary: str | None = None
-    tags: list[str] | None = None
-    size: int | None = None
-    score: float | None = None
+    text: str = Field(description="Matching passage")
+    url: str = Field(description="Where a person opens it; cite this")
 
 
 class SearchResults(BaseModel):
-    results: list[Hit]
-    next_cursor: str | None = Field(None, description="Pass back as cursor for the next page")
+    results: list[SearchResult]
+    next_cursor: str | None = Field(None, description="Pass back as cursor for more results")
 
 
-class FetchedItem(BaseModel):
+class Document(BaseModel):
     id: str
     title: str
     text: str
-    url: str | None = None
-    metadata: dict[str, Any] = {}
-    next_offset: int | None = Field(None, description="Pass as offset to read on; null at the end")
+    url: str
+    metadata: dict[str, Any] = Field(default_factory=dict, description=(
+        "Frontmatter, rev (pass as base_rev to write), backlinks, download_url for files, "
+        "next_offset when the text continues"))
+
+
+class SqlResult(BaseModel):
+    columns: list[str]
+    rows: list[dict[str, Any]]
+    truncated: bool = Field(description="More rows exist; pass next_cursor to continue")
+    next_cursor: str | None = None
 
 
 class FrontmatterPatch(BaseModel):
@@ -40,52 +44,18 @@ class FrontmatterPatch(BaseModel):
 
 
 class Change(BaseModel):
-    path: str = Field(description="Vault path, e.g. notes/my-note or files/slides")
-    content: str | None = Field(None, description="Whole new file (frontmatter + body)")
-    frontmatter: FrontmatterPatch | None = Field(None, description="Change only frontmatter fields")
+    path: str = Field(description="Vault path, e.g. notes/my-note or files/slides (.md is implied)")
+    content: str | None = Field(None, description="The whole new file: frontmatter + body")
+    frontmatter: FrontmatterPatch | None = Field(None, description="Change only these frontmatter fields")
+    move_to: str | None = Field(None, description="Rename/move the page; links to it are rewritten everywhere")
+    base_rev: str | None = Field(None, description=(
+        "rev you read (fetch metadata.rev or notes.rev); refused if the page changed since. 'new' = must not exist"))
 
 
 class WriteResult(BaseModel):
-    paths: list[str]
     commit: str
-
-
-class CommitInfo(BaseModel):
-    sha: str
-    date: str
-    author: str
-    message: str
-
-
-class History(BaseModel):
-    commits: list[CommitInfo]
-    next_cursor: str | None = None
-
-
-class Link(BaseModel):
-    url: str
-    expires_at: str
-    curl: str = Field(description="Download command for an agent with a shell")
-
-
-class Upload(BaseModel):
-    id: str = Field(description="Pass to upload_status() after uploading")
-    page_url: str = Field(description="Upload page for a person (drag and drop)")
-    put_url_template: str = Field(description="PUT a file to this URL with {filename} replaced (URL-encoded)")
-    curl: str = Field(description="Upload command for an agent with a shell")
-    expires_at: str
-
-
-class Filed(BaseModel):
-    note: str = Field(description="The file note, e.g. files/slides")
-    blob: str | None = None
-    duplicate: bool = False
-
-
-class UploadStatus(BaseModel):
-    id: str
-    filed: list[Filed]
-    waiting: list[str]
+    revs: dict[str, str | None] = Field(description="New rev of every path touched (null = deleted)")
+    replayed: bool = Field(False, description="True when this idempotency_key was already applied; nothing changed")
 
 
 class FileRef(BaseModel):
@@ -96,15 +66,9 @@ class FileRef(BaseModel):
     mime_type: str | None = None
 
 
-class ReviewItem(BaseModel):
-    id: str
-    title: str
-    summary: str | None = None
-    as_of: str | None = None
-    status: str | None = None
-    url: str | None = None
-
-
-class ReviewQueue(BaseModel):
-    items: list[ReviewItem]
-    remaining: int
+class UploadResult(BaseModel):
+    note: str | None = Field(None, description="The file note created (or found, if the file was already there)")
+    duplicate: bool | None = None
+    put_url: str | None = Field(None, description="HTTP PUT target; replace {filename} (URL-encoded)")
+    curl: str | None = Field(None, description="Ready upload command; prints the file note as JSON")
+    expires_at: str | None = None

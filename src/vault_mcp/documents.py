@@ -7,6 +7,7 @@ import mimetypes
 import os
 import re
 import subprocess
+import urllib.parse
 import zipfile
 from pathlib import Path
 
@@ -22,6 +23,17 @@ PLAIN = {".txt", ".md", ".markdown", ".csv", ".tsv", ".json", ".jsonl", ".yaml",
 OFFICE = {".docx", ".pptx", ".xlsx", ".odt", ".odp", ".ods"}
 EXTRACTABLE = PLAIN | OFFICE | {".pdf"}
 MAX_TEXT = 2_000_000
+# Slim images ship no /etc/mime.types, so the common types are spelled out.
+MIME = {
+    ".pdf": "application/pdf", ".md": "text/markdown", ".csv": "text/csv", ".json": "application/json",
+    ".docx": "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+    ".pptx": "application/vnd.openxmlformats-officedocument.presentationml.presentation",
+    ".xlsx": "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+    ".odt": "application/vnd.oasis.opendocument.text", ".odp": "application/vnd.oasis.opendocument.presentation",
+    ".ods": "application/vnd.oasis.opendocument.spreadsheet", ".mp4": "video/mp4", ".mov": "video/quicktime",
+    ".mkv": "video/x-matroska", ".webm": "video/webm", ".mp3": "audio/mpeg", ".m4a": "audio/mp4",
+    ".png": "image/png", ".jpg": "image/jpeg", ".jpeg": "image/jpeg", ".webp": "image/webp", ".heic": "image/heic",
+}
 
 
 class DocumentError(ValueError):
@@ -37,7 +49,14 @@ def media_of(path: Path | str) -> str:
 
 
 def mime_of(path: Path | str) -> str:
-    return mimetypes.guess_type(str(path))[0] or "application/octet-stream"
+    return MIME.get(Path(path).suffix.lower()) or mimetypes.guess_type(str(path))[0] or "application/octet-stream"
+
+
+def safe_name(name: str) -> str:
+    """A file name that is safe on disk and in a URL path segment."""
+    name = Path(urllib.parse.unquote(name or "")).name
+    name = re.sub(r"[^\w.\- ()]+", "-", name).strip(" .-")
+    return (name or "file")[:120]
 
 
 def sha256_of(path: Path) -> str:
@@ -65,7 +84,7 @@ def relative(path: Path) -> str:
 
 
 def walk(root: Path):
-    """Visible files under root, skipping hidden files and folders (.inbox, .stversions, ...)."""
+    """Visible files under root, skipping hidden files and folders (.stversions, ...)."""
     for dirpath, dirnames, names in os.walk(root):
         dirnames[:] = sorted(n for n in dirnames if not n.startswith("."))
         for name in sorted(names):
