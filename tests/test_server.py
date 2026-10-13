@@ -107,6 +107,8 @@ async def test_search_ranks_and_answers_in_the_shape_chatgpt_expects(env):
     assert set(top) == {"id", "title", "text", "url"} and "Acme" in top["text"]
     assert top["id"] == "notes/i-work-at-acme" and top["url"] == "https://notes.example/notes/i-work-at-acme"
     assert [r.id for r in (await call("search", query='"founded in 1999"')).results] == ["notes/acme-history"]
+    either = [r.id for r in (await call("search", query="1999 work")).results]  # no page has both words
+    assert set(either) == {"notes/acme-history", "notes/i-work-at-acme"}
 
 
 async def test_fetch_reads_pages_old_versions_and_suggests_on_a_miss(env):
@@ -318,6 +320,8 @@ async def test_the_worker_files_drops_commits_outside_edits_and_reports_problems
     problems = await rows("SELECT kind, id FROM problems WHERE kind IN ('broken-link', 'sync-conflict') ORDER BY kind")
     assert problems == [{"kind": "broken-link", "id": "notes/typed-in-obsidian"},
                         {"kind": "sync-conflict", "id": "notes/acme.sync-conflict-20261013-ABC.md"}]
+    await call("delete", paths=["notes/acme.sync-conflict-20261013-ABC.md"], message="merged")
+    assert not (root / "notes/acme.sync-conflict-20261013-ABC.md").exists()
 
 
 async def test_documents_are_searchable_readable_and_confined(env):

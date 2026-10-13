@@ -295,17 +295,20 @@ def decode_cursor(cursor: str | None) -> int:
         raise ValueError("invalid cursor; start again without one") from None
 
 
-def fts_query(text: str) -> str:
-    """Words match as prefixes and must all occur; "quoted phrases" match exactly."""
+def fts_query(text: str, any_term: bool = False) -> str:
+    """Words match as prefixes, "quoted phrases" exactly; all terms must occur unless any_term."""
     phrases = [p.replace('"', "") for p in re.findall(r'"([^"]+)"', text)]
     words = re.findall(r"\w+", re.sub(r'"[^"]*"', " ", text))
-    return " ".join([f'"{p}"' for p in phrases] + [f'"{w}"*' for w in words])
+    return (" OR " if any_term else " ").join([f'"{p}"' for p in phrases] + [f'"{w}"*' for w in words])
 
 
 def search(conn: sqlite3.Connection, query: str, limit: int, offset: int) -> tuple[list[sqlite3.Row], bool]:
+    """Pages with all the terms; when none has all of them, pages with any, best (BM25) first."""
     expr = fts_query(query)
     if not expr:
         raise ValueError("search needs at least one word")
+    if not conn.execute("SELECT 1 FROM fts WHERE fts MATCH ? LIMIT 1", (expr,)).fetchone():
+        expr = fts_query(query, any_term=True)
     rows = conn.execute(
         "SELECT id, title, snippet(fts, 3, '', '', '…', 24) AS snippet FROM fts WHERE fts MATCH ? "
         "ORDER BY bm25(fts, 0.0, 10.0, 4.0, 1.0) LIMIT ? OFFSET ?", (expr, limit + 1, offset)).fetchall()

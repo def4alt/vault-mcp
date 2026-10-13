@@ -63,8 +63,9 @@ def _iso(ts: float) -> str:
 @vault.tool(annotations=_annotations("Search the vault", read_only=True))
 def search(query: str, limit: int = 10, cursor: str | None = None) -> SearchResults:
     """Ranked full-text search over notes, sources, projects, file notes (including the text inside the
-    files) and documents. All words must match (as prefixes); "quoted phrases" match exactly.
-    Then fetch(id). For filters, tags, links, dates or counts use `sql`."""
+    files) and documents. Words match as prefixes, "quoted phrases" exactly. Pages with all the words
+    come first; if none has all of them, pages with any are ranked. Then fetch(id). For filters, tags,
+    links, dates or counts use `sql`."""
     offset = index.decode_cursor(cursor)
     with index.connect() as conn:
         index.sync_vault(conn)  # a stat scan: picks up edits made in Obsidian or SilverBullet
@@ -147,29 +148,16 @@ def fetch(id: str, offset: int = 0) -> Document:
 
 @vault.tool(annotations=_annotations("Query the index with SQL", read_only=True))
 def sql(sql: str, params: list[Any] | None = None, limit: int = 100, cursor: str | None = None) -> SqlResult:
-    """Read-only SQLite over the vault's index (one SELECT/WITH statement, 5 s, rows as objects).
-
-    notes(id, uid, folder, kind, status, title, summary, tags JSON, as_of, reviewed, blob, sha256, rev,
-          mtime, size, fm JSON)      every page; id is its path (notes/x, files/x); fm has all frontmatter
-    documents(id 'doc:<path>', path, folder, name, media, mime, size, sha256)
-    links(src, dst, field)           field: body, embed, source, about, related, supersedes, projects
-    tags(id, tag)                    facets(id, field, value) also has categories, kind, status, origin, media
-    files(id, title, name, mime, size, tags, summary, blob, sha256, url)   url = signed download link
-    fts(id, title, summary, body)    full text, incl. text inside files and documents (FTS5: MATCH, bm25,
-                                     snippet); join on id
-    commits(sha, date, author, message), commit_files(sha, id)             history
-    problems(kind, id, detail)       broken-link, orphan, stale, conflict, undistilled, schema, blob, ...
-    link(blob_or_doc_id [, name])    function returning a signed download URL
-
-    Examples:
-      backlinks:   SELECT src FROM links WHERE dst = 'notes/acme'
-      by tag:      SELECT id, title FROM notes WHERE id IN (SELECT id FROM tags WHERE tag = 'slides')
-      to review:   SELECT id, title, as_of FROM notes WHERE kind = 'fact' AND status = 'unreviewed' ORDER BY as_of
-      a field:     SELECT id FROM notes WHERE json_extract(fm, '$.rating') >= 4
-      recent:      SELECT c.date, c.author, c.message, f.id FROM commits c JOIN commit_files f USING (sha)
-                   ORDER BY c.date DESC LIMIT 20
-      full text:   SELECT id, snippet(fts, 3, '[', ']', '…', 12) FROM fts WHERE fts MATCH 'transformer'
-    Use ? placeholders with params. Long cells are clipped; use substr() to read on."""
+    """Read-only SQLite over the vault index: one SELECT/WITH, 5 s, rows as objects, ? params.
+    notes(id=path, uid, folder, kind, status, title, summary, tags JSON, as_of, reviewed, blob, sha256, rev,
+    mtime, size, fm=frontmatter JSON); documents(id 'doc:<path>', path, folder, name, media, mime, size);
+    links(src, dst, field: body|embed|source|about|related|supersedes|projects); tags(id, tag);
+    facets(id, field, value); files(id, name, mime, size, tags, summary, blob, url=download link);
+    fts(id, title, summary, body): FTS5 incl. text inside files; commits(sha, date, author, message);
+    commit_files(sha, id); problems(kind, id, detail). link(blob_or_doc_id) signs a download URL.
+    E.g. SELECT src FROM links WHERE dst = 'notes/acme' | SELECT id FROM tags WHERE tag = 'slides' |
+    SELECT id FROM notes WHERE kind = 'fact' AND status = 'unreviewed' | SELECT id, snippet(fts, 3, '[',
+    ']', '…', 12) FROM fts WHERE fts MATCH 'transformer' ORDER BY bm25(fts). Long cells are clipped."""
     with index.connect() as conn:
         index.sync_vault(conn)
     offset = index.decode_cursor(cursor)
@@ -288,8 +276,8 @@ def write(changes: list[Change], message: str, ctx: Context, idempotency_key: st
 def delete(paths: list[str], message: str, ctx: Context, idempotency_key: str | None = None) -> WriteResult:
     """Delete pages that are wrong or redundant, in one commit (history keeps them: fetch("x@<commit>")
     and write them back to restore). Deleting a file note keeps its file; a file no note refers to
-    any more (problems kind 'blob') can be deleted by its path, blobs/<hash>.<ext> - that one is gone
-    for good."""
+    any more (problems kind 'blob') can be deleted by its path, blobs/<hash>.<ext>, and so can a
+    Syncthing conflict copy (problems kind 'sync-conflict') once merged; those two are gone for good."""
     if not paths:
         raise ToolError("no paths")
     name, who = author(ctx)
@@ -298,6 +286,13 @@ def delete(paths: list[str], message: str, ctx: Context, idempotency_key: str | 
             return replay
         pages, blobs = [], []
         for raw in paths:
+            if ".sync-conflict-" in raw:
+                copy = (config.VAULT_ROOT / raw.strip().lstrip("/")).resolve()
+                root = config.VAULT_ROOT.resolve()
+                if root not in copy.parents or ".git" in copy.relative_to(root).parts or not copy.is_file():
+                    raise ToolError(f"no conflict copy `{raw}`")
+                blobs.append(str(copy.relative_to(root)))
+                continue
             if raw.strip().lstrip("/").startswith("blobs/"):
                 blob = raw.strip().lstrip("/")
                 if not signing.BLOB.fullmatch(blob.removeprefix("blobs/")) or not (config.VAULT_ROOT / blob).is_file():
@@ -315,7 +310,7 @@ def delete(paths: list[str], message: str, ctx: Context, idempotency_key: str | 
             pages.append(path)
         for path in pages:
             (config.VAULT_ROOT / path).unlink()
-        sha = repo.commit(pages, f"{message} ({who})", name, idempotency_key) if pages else "no changes"
+        sha = repo.commit(pages, f"{message} ({who})", name, idempotency_key) if pages else "none (not in git)"
         for blob in blobs:
             (config.VAULT_ROOT / blob).unlink()
     index.reindex(pages)

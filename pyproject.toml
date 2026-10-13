@@ -1,6 +1,6 @@
 [project]
 name = "vault-mcp"
-version = "0.4.0"
+version = "0.4.1"
 description = "MCP server for a personal Markdown knowledge vault"
 readme = "README.md"
 authors = [
