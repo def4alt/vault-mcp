@@ -1,7 +1,9 @@
-"""The documents tree: safe paths, file kinds, text extraction and the text cache."""
+"""Files on disk: safe paths, media kinds, hashing, and text extraction cached by content hash."""
 from __future__ import annotations
 
+import hashlib
 import html
+import mimetypes
 import os
 import re
 import subprocess
@@ -26,12 +28,24 @@ class DocumentError(ValueError):
     pass
 
 
-def kind_of(path: Path | str) -> str:
+def media_of(path: Path | str) -> str:
     ext = Path(path).suffix.lower()
-    for kind, exts in (("video", VIDEO), ("audio", AUDIO), ("image", IMAGE), ("data", DATA)):
+    for media, exts in (("video", VIDEO), ("audio", AUDIO), ("image", IMAGE), ("data", DATA)):
         if ext in exts:
-            return kind
+            return media
     return "document"
+
+
+def mime_of(path: Path | str) -> str:
+    return mimetypes.guess_type(str(path))[0] or "application/octet-stream"
+
+
+def sha256_of(path: Path) -> str:
+    h = hashlib.sha256()
+    with path.open("rb") as fh:
+        while chunk := fh.read(1 << 20):
+            h.update(chunk)
+    return h.hexdigest()
 
 
 def resolve(rel: str) -> Path:
@@ -51,7 +65,7 @@ def relative(path: Path) -> str:
 
 
 def walk(root: Path):
-    """Visible files under root, skipping hidden files and folders (.inbox, .stversions...)."""
+    """Visible files under root, skipping hidden files and folders (.inbox, .stversions, ...)."""
     for dirpath, dirnames, names in os.walk(root):
         dirnames[:] = sorted(n for n in dirnames if not n.startswith("."))
         for name in sorted(names):
@@ -100,24 +114,33 @@ def extract_text(path: Path) -> str | None:
     return text[:MAX_TEXT] or None
 
 
-def cache_path(rel: str) -> Path:
-    return config.CACHE_ROOT / "text" / f"{rel}.txt"
+def _cache(sha: str) -> Path:
+    return config.CACHE_ROOT / "text" / sha[:2] / f"{sha}.txt"
 
 
-def text_of(rel: str) -> str | None:
-    """Cached text if the worker has extracted it, otherwise extracted on the spot."""
-    cached = cache_path(rel)
-    if cached.exists():
-        return cached.read_text("utf-8", "replace") or None
-    return extract_text(resolve(rel))
+def cached_text(sha: str) -> str | None:
+    p = _cache(sha)
+    return (p.read_text("utf-8", "replace") or None) if p.exists() else None
 
 
-def refresh_cache(rel: str, src: Path) -> str | None:
-    """(Re)extract one document into the cache. An empty cache file means "tried, no text"."""
-    text = extract_text(src) if src.suffix.lower() in EXTRACTABLE else None
-    dest = cache_path(rel)
-    dest.parent.mkdir(parents=True, exist_ok=True)
-    tmp = dest.with_name(f".{dest.name}.tmp")
+def text_for(path: Path, sha: str) -> str | None:
+    """Extracted text of a file, cached by content hash (an empty cache file means "no text")."""
+    p = _cache(sha)
+    if p.exists():
+        return p.read_text("utf-8", "replace") or None
+    text = extract_text(path) if path.suffix.lower() in EXTRACTABLE else None
+    p.parent.mkdir(parents=True, exist_ok=True)
+    tmp = p.with_name(f".{p.name}.tmp")
     tmp.write_text(text or "", "utf-8")
-    os.replace(tmp, dest)
+    os.replace(tmp, p)
     return text
+
+
+def prune_text_cache(keep: set[str]) -> int:
+    """Delete extracts whose content hash no longer appears anywhere."""
+    removed = 0
+    for p in walk(config.CACHE_ROOT / "text"):
+        if p.stem not in keep:
+            p.unlink()
+            removed += 1
+    return removed

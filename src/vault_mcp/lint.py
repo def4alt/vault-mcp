@@ -24,10 +24,14 @@ def slug(text: str) -> str:
     return re.sub(r"[^a-z0-9]+", "-", text.lower()).strip("-")
 
 
+def _as_list(value) -> list:
+    return value if isinstance(value, list) else [value]
+
+
 def schema_errors(page: Page, schema: dict) -> list[str]:
     if page.meta.get("__invalid__"):
         return ["frontmatter is not valid YAML"]
-    section = {"notes": "notes", "sources": "sources", "projects": "projects"}[page.path.split("/")[0]]
+    section = page.path.split("/")[0]
     spec = schema[section]
     errors = [f"missing `{k}`" for k in spec["required"] if page.meta.get(k) in (None, "", [])]
     for key, value in page.meta.items():
@@ -44,8 +48,9 @@ def schema_errors(page: Page, schema: dict) -> list[str]:
         kind = rule.get("type")
         if kind == "date" and as_date(value) is None:
             errors.append(f"`{key}` is not a YYYY-MM-DD date")
-        if kind == "int" and not (isinstance(value, int) and rule["min"] <= value <= rule["max"]):
-            errors.append(f"`{key}` must be an integer {rule['min']}-{rule['max']}")
+        lo, hi = rule.get("min", float("-inf")), rule.get("max", float("inf"))
+        if kind == "int" and not (isinstance(value, int) and lo <= value <= hi):
+            errors.append(f"`{key}` must be an integer" + (f" {lo}-{hi}" if "min" in rule else ""))
         if kind == "list":
             if not isinstance(value, list):
                 errors.append(f"`{key}` must be a list")
@@ -56,7 +61,7 @@ def schema_errors(page: Page, schema: dict) -> list[str]:
                 for v in value:
                     if not re.fullmatch(r"\[\[[^\]]+\]\]", str(v)):
                         errors.append(f"`{key}` item `{v}` is not a wikilink")
-                    elif rule.get("prefix") and not str(v)[2:].startswith(rule["prefix"]):
+                    elif rule.get("prefix") and not str(v)[2:].startswith(tuple(_as_list(rule["prefix"]))):
                         errors.append(f"`{key}` item `{v}` must point into {rule['prefix']}")
     if section == "notes" and page.kind == "fact":
         errors += [f"fact missing `{k}`" for k in ("status", "as_of") if not page.meta.get(k)]
@@ -81,7 +86,7 @@ def lint(vault: Vault, today: dt.date | None = None) -> dict[str, list[str]]:
 
     r: dict[str, list[str]] = {k: [] for k in (
         "Broken links", "Conflicts", "Superseded but not outdated", "Stale confirmed facts",
-        "Orphans", "Undistilled sources", "Missing entities", "Schema violations")}
+        "Orphans", "Undistilled sources", "Missing entities", "Schema violations", "Blobs")}
 
     for p in vault.pages.values():
         for t in sorted(p.links | p.embeds):
@@ -108,8 +113,19 @@ def lint(vault: Vault, today: dt.date | None = None) -> dict[str, list[str]]:
             r["Orphans"].append(f"[[{p.path}]]")
 
     for p in vault.pages.values():
-        if p.path.startswith("sources/") and p.path not in backlinked:
+        if p.path.startswith(("sources/", "files/")) and p.path not in backlinked:
             r["Undistilled sources"].append(f"[[{p.path}]]")
+
+    referenced = set()
+    for p in vault.pages.values():
+        if p.path.startswith("files/") and p.meta.get("blob"):
+            referenced.add(str(p.meta["blob"]))
+            if not (vault.root / str(p.meta["blob"])).exists():
+                r["Blobs"].append(f"[[{p.path}]]: its blob `{p.meta['blob']}` is missing")
+    blob_dir = vault.root / "blobs"
+    for f in sorted(blob_dir.iterdir()) if blob_dir.is_dir() else []:
+        if not f.name.startswith(".") and f"blobs/{f.name}" not in referenced:
+            r["Blobs"].append(f"`blobs/{f.name}` has no file note (write one, or delete the blob)")
 
     names: Counter[str] = Counter()
     for p in notes:

@@ -13,12 +13,9 @@ from fastmcp.server.middleware import Middleware
 from prometheus_client import Counter, Histogram
 
 from .. import config
-from ..documents import DocumentError
 from ..repo import GitError
-from ..rules import RuleViolation
-from .identity import client_name
+from .identity import BEARER_SUBJECT, client_name
 
-BEARER_SUBJECT = "hermes"
 CALLS = Counter("vault_mcp_tool_calls_total", "Tool calls", ["tool", "client", "outcome"])
 LATENCY = Histogram("vault_mcp_tool_seconds", "Tool latency", ["tool"])
 
@@ -72,7 +69,7 @@ class Gatekeeper(Middleware):
         start = time.perf_counter()
         try:
             result = await call_next(context)
-        except (RuleViolation, DocumentError, GitError, OSError) as e:
+        except (ValueError, GitError, OSError) as e:  # rule violations, bad input, missing files
             CALLS.labels(tool, client, "refused").inc()
             raise ToolError(str(e)) from None
         except Exception:

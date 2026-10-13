@@ -1,4 +1,4 @@
-"""Who is calling: the MCP client's name (claude-ai, openai-mcp, hermes...) and the signed-in account."""
+"""Who is calling, for commits, file notes and metrics."""
 from __future__ import annotations
 
 import datetime as dt
@@ -7,15 +7,20 @@ import re
 from fastmcp import Context
 from fastmcp.server.dependencies import get_access_token
 
+BEARER_SUBJECT = "hermes"  # the claims login of the static bearer token
+
 
 def client_name(ctx: Context | None) -> str:
+    """The bearer token names Hermes; OAuth clients name themselves (claude-ai, openai-mcp, ...)."""
+    token = get_access_token()
+    if token is not None and token.claims.get("login") == BEARER_SUBJECT:
+        return BEARER_SUBJECT
     info = None
     if ctx is not None:
         try:
             info = ctx.session.client_params.client_info
         except (AttributeError, RuntimeError):
             info = None
-    token = get_access_token()
     name = (info.name if info else None) or (token.claims.get("login") if token else None) or "local"
     return re.sub(r"[^A-Za-z0-9._-]+", "-", name)[:40]
 

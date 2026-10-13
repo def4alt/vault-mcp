@@ -1,25 +1,52 @@
 """Typed tool results; FastMCP publishes them as output schemas."""
 from __future__ import annotations
 
-from typing import Any, Literal
+from typing import Any
 
 from pydantic import BaseModel, Field
 
 
-class PageInfo(BaseModel):
-    path: str
+class Hit(BaseModel):
+    id: str = Field(description="Pass to fetch(). Vault pages: notes/x, files/x...; documents: doc:<path>")
     title: str
+    url: str | None = Field(None, description="Where Andrii can open it (cite this)")
     kind: str | None = None
+    snippet: str | None = None
     status: str | None = None
     as_of: str | None = None
-    reviewed: str | None = None
-    categories: list[str] = []
     summary: str | None = None
+    tags: list[str] | None = None
+    size: int | None = None
+    score: float | None = None
+
+
+class SearchResults(BaseModel):
+    results: list[Hit]
+    next_cursor: str | None = Field(None, description="Pass back as cursor for the next page")
+
+
+class FetchedItem(BaseModel):
+    id: str
+    title: str
+    text: str
+    url: str | None = None
+    metadata: dict[str, Any] = {}
+    next_offset: int | None = Field(None, description="Pass as offset to read on; null at the end")
+
+
+class FrontmatterPatch(BaseModel):
+    set: dict[str, Any] = {}
+    unset: list[str] = []
+
+
+class Change(BaseModel):
+    path: str = Field(description="Vault path, e.g. notes/my-note or files/slides")
+    content: str | None = Field(None, description="Whole new file (frontmatter + body)")
+    frontmatter: FrontmatterPatch | None = Field(None, description="Change only frontmatter fields")
 
 
 class WriteResult(BaseModel):
     paths: list[str]
-    action: str
     commit: str
 
 
@@ -30,34 +57,9 @@ class CommitInfo(BaseModel):
     message: str
 
 
-class Change(BaseModel):
-    path: str = Field(description="Vault path, e.g. notes/my-note")
-    content: str | None = Field(None, description="Whole new file (frontmatter + body); omit with delete=true")
-    delete: bool = False
-
-
-class FileEntry(BaseModel):
-    path: str
-    kind: Literal["dir", "document", "video", "audio", "image", "data"]
-    size: int = 0
-    modified: str | None = None
-    has_text: bool = False
-
-
-class FileHit(BaseModel):
-    path: str
-    kind: str
-    snippet: str = ""
-
-
-class FileText(BaseModel):
-    path: str
-    kind: str
-    size: int
-    text: str
-    offset: int
-    next_offset: int | None = Field(None, description="Pass as offset to read on; null at the end")
-    total_chars: int
+class History(BaseModel):
+    commits: list[CommitInfo]
+    next_cursor: str | None = None
 
 
 class Link(BaseModel):
@@ -67,14 +69,19 @@ class Link(BaseModel):
 
 class Upload(BaseModel):
     id: str
-    url: str
+    url: str = Field(description="Upload page for Andrii; files PUT to it land in the vault")
     expires_at: str
-    delivered: str = Field(description="'elicitation:<action>' if the client showed the page to the user, else 'link'")
+
+
+class Filed(BaseModel):
+    note: str = Field(description="The file note, e.g. files/slides")
+    blob: str | None = None
+    duplicate: bool = False
 
 
 class UploadStatus(BaseModel):
     id: str
-    ingested: list[dict[str, Any]]
+    filed: list[Filed]
     waiting: list[str]
 
 
@@ -84,3 +91,17 @@ class FileRef(BaseModel):
     file_id: str
     file_name: str | None = None
     mime_type: str | None = None
+
+
+class ReviewItem(BaseModel):
+    id: str
+    title: str
+    summary: str | None = None
+    as_of: str | None = None
+    status: str | None = None
+    url: str | None = None
+
+
+class ReviewQueue(BaseModel):
+    items: list[ReviewItem]
+    remaining: int

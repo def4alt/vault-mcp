@@ -1,0 +1,100 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Add files to the vault</title>
+<style>
+  :root {
+    --bg: var(--color-background-primary, #ffffff); --fg: var(--color-text-primary, #1c1917);
+    --muted: var(--color-text-secondary, #78716c); --line: var(--color-border-primary, #d6d3d1);
+    --accent: #2563eb; --ok: #15803d; --bad: #b91c1c;
+    font-family: var(--font-sans, system-ui, sans-serif); color-scheme: light dark;
+  }
+  :root[data-theme="dark"] { --bg: var(--color-background-primary, #1c1917); --fg: var(--color-text-primary, #f5f5f4);
+    --muted: var(--color-text-secondary, #a8a29e); --line: var(--color-border-primary, #44403c); --accent: #60a5fa; --ok: #4ade80; --bad: #f87171; }
+  body { margin: 0; padding: 16px; background: var(--bg); color: var(--fg); font-size: 14px; line-height: 1.45; }
+  h1 { font-size: 15px; margin: 0 0 4px; } p { margin: 0 0 12px; color: var(--muted); }
+  label.drop { display: block; border: 2px dashed var(--line); border-radius: 10px; padding: 28px 12px; text-align: center; cursor: pointer; }
+  label.drop.over { border-color: var(--accent); } input { display: none; }
+  ul { list-style: none; padding: 0; margin: 12px 0 0; }
+  li { display: flex; justify-content: space-between; gap: 12px; padding: 6px 0; border-bottom: 1px solid var(--line); }
+  li span:last-child { color: var(--muted); white-space: nowrap; } .ok { color: var(--ok) !important; } .bad { color: var(--bad) !important; }
+  button { margin-top: 12px; padding: 6px 12px; border-radius: 8px; border: 1px solid var(--line); background: var(--accent); color: #fff; cursor: pointer; }
+  button[hidden] { display: none; } a { color: var(--accent); cursor: pointer; }
+</style>
+</head>
+<body>
+  <h1>Add files to the vault</h1>
+  <p id="purpose">Waiting for the upload link…</p>
+  <label class="drop" id="drop">Drop files here or click to choose (up to 95 MB each)<input id="pick" type="file" multiple disabled></label>
+  <ul id="list"></ul>
+  <button id="tell" hidden>Tell the assistant</button>
+<script>/*BRIDGE*/</script>
+<script>
+  const MAX = 95 * 1024 * 1024;
+  let upload = null, sent = 0, filed = [];
+  const $ = (id) => document.getElementById(id);
+
+  function row(name) {
+    const li = document.createElement("li"), label = document.createElement("span"), state = document.createElement("span");
+    label.textContent = name; li.append(label, state); $("list").append(li);
+    return state;
+  }
+
+  function put(file) {
+    const state = row(file.name);
+    if (file.size > MAX) { state.textContent = "too large, drop it into Agent/inbox instead"; state.className = "bad"; return; }
+    const [base, query] = upload.url.split("?");
+    const name = file.name.replace(/[\/\\]/g, "-").replace(/^\.+/, "") || "file";
+    const xhr = new XMLHttpRequest();
+    xhr.open("PUT", `${base}${encodeURIComponent(name)}?${query}`);
+    xhr.upload.onprogress = (e) => { if (e.lengthComputable) state.textContent = `${Math.round(100 * e.loaded / e.total)}%`; };
+    xhr.onload = () => {
+      if (xhr.status < 300) { state.textContent = "filing…"; sent += 1; waitForFiling(); }
+      else { state.textContent = xhr.status === 410 ? "link expired" : `failed (${xhr.status})`; state.className = "bad"; }
+    };
+    xhr.onerror = () => { state.textContent = "failed"; state.className = "bad"; };
+    xhr.send(file);
+  }
+
+  let polling = false;
+  async function waitForFiling() {
+    if (polling) return;
+    polling = true;
+    try {
+      for (let i = 0; i < 60; i++) {
+        const status = await mcpApp.callTool("upload_status", { id: upload.id });
+        filed = status.filed || [];
+        const rows = [...$("list").children].filter((li) => li.lastChild.textContent === "filing…");
+        filed.forEach((f, n) => { if (rows[n]) { rows[n].lastChild.textContent = f.duplicate ? `already in ${f.note}` : f.note; rows[n].lastChild.className = "ok"; } });
+        if (filed.length >= sent && !(status.waiting || []).length) break;
+        await new Promise((r) => setTimeout(r, 2000));
+      }
+    } finally { polling = false; }
+    $("tell").hidden = filed.length === 0;
+  }
+
+  $("tell").onclick = () => mcpApp.message(
+    `I added ${filed.length} file(s) to the vault (upload ${upload.id}): ${filed.map((f) => f.note).join(", ")}. ` +
+    "Please describe and tag them, and link them where they belong.");
+
+  const start = (files) => [...files].forEach(put);
+  $("pick").onchange = (e) => start(e.target.files);
+  $("drop").ondragover = (e) => { e.preventDefault(); $("drop").classList.add("over"); };
+  $("drop").ondragleave = () => $("drop").classList.remove("over");
+  $("drop").ondrop = (e) => { e.preventDefault(); $("drop").classList.remove("over"); if (upload) start(e.dataTransfer.files); };
+
+  mcpApp.on("ui/notifications/tool-input", ({ arguments: args }) => {
+    if (args?.purpose) $("purpose").textContent = args.purpose;
+  });
+  mcpApp.on("ui/notifications/tool-result", (result) => {
+    upload = result.structuredContent;
+    if (!upload?.url) { $("purpose").textContent = "No upload link was created."; return; }
+    $("pick").disabled = false;
+    $("purpose").textContent += ` · link valid until ${new Date(upload.expires_at).toLocaleTimeString()}`;
+  });
+  mcpApp.start("vault-upload");
+</script>
+</body>
+</html>

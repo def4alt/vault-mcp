@@ -1,35 +1,35 @@
-"""Ingest worker: inbox -> shared space -> source notes, and documents -> text cache.
+"""The worker: files whatever arrives and keeps the index current.
 
-A plain polling loop over files. Every step is idempotent, so a crash or restart
-picks up where it left off, and the text cache can be deleted and rebuilt.
+Each cycle:
+  1. inbox/<id>/*       (upload page, URL fetches, ChatGPT attachments) -> filing.file()
+  2. Agent/inbox/*      (Syncthing drop folder on the Mac and zorya)    -> filing.file()
+  3. index sync         (vault pages every cycle; documents with text extraction)
+  4. prune              (text extracts no item refers to)
+
+Every step is idempotent; a crash or restart picks up where it left off.
 
     vault-worker            # loop forever
     vault-worker --once     # a single pass
 """
 from __future__ import annotations
 
-import datetime as dt
-import hashlib
 import json
 import logging
-import os
 import sys
 import time
-from pathlib import Path
 
 from prometheus_client import Counter, Gauge, start_http_server
 
-from . import config, documents, repo, rules, sharing
-from .vault import Vault, render, slugify, unique_path
+from . import config, documents, filing, index, sharing
 
 log = logging.getLogger("vault-worker")
-TEXT_EVERY = 6  # refresh the documents text cache every TEXT_EVERY cycles
+DOCUMENTS_EVERY = 6  # documents tree scan every DOCUMENTS_EVERY cycles (~1 min)
 
-FILES = Counter("vault_worker_files_total", "Files handled by the worker", ["outcome"])
+FILED = Counter("vault_worker_files_total", "Files handled by the worker", ["outcome"])
 ERRORS = Counter("vault_worker_errors_total", "Failed worker cycles")
-INBOX_AGE = Gauge("vault_inbox_oldest_seconds", "Age of the oldest file waiting in the inbox")
-SHARED_BYTES = Gauge("vault_shared_bytes", "Bytes used by the shared space and the inbox")
-TEXT_FILES = Gauge("vault_text_cache_files", "Documents with extracted text")
+INBOX_AGE = Gauge("vault_inbox_oldest_seconds", "Age of the oldest file waiting to be filed")
+STORED_BYTES = Gauge("vault_stored_bytes", "Bytes in the blob store and the inbox")
+INDEXED = Gauge("vault_index_items", "Items in the search index", ["scope"])
 LAST_RUN = Gauge("vault_worker_last_run_timestamp_seconds", "End of the last successful cycle")
 
 
@@ -41,150 +41,65 @@ def origin_of(client: str) -> str:
     return "manual"
 
 
-def sha256(path: Path) -> str:
-    h = hashlib.sha256()
-    with path.open("rb") as fh:
-        while chunk := fh.read(1 << 20):
-            h.update(chunk)
-    return h.hexdigest()
+def _record(upload_id: str, results: list[dict]) -> None:
+    done = config.INBOX_ROOT / ".done" / f"{upload_id}.json"
+    previous = json.loads(done.read_text()) if done.exists() else []
+    done.write_text(json.dumps(previous + results))
 
 
-class Hashes:
-    """Content hashes of shared files, cached by (size, mtime) under CACHE_ROOT/state."""
-
-    def __init__(self):
-        self.path = config.CACHE_ROOT / "state" / "hashes.json"
-        self.entries: dict[str, list] = json.loads(self.path.read_text()) if self.path.exists() else {}
-
-    def of(self, rel: str, p: Path) -> str:
-        st = p.stat()
-        cached = self.entries.get(rel)
-        if cached and cached[:2] == [st.st_size, st.st_mtime_ns]:
-            return cached[2]
-        digest = sha256(p)
-        self.entries[rel] = [st.st_size, st.st_mtime_ns, digest]
-        return digest
-
-    def find(self, digest: str) -> str | None:
-        return next((rel for rel, v in self.entries.items() if v[2] == digest), None)
-
-    def save(self, live: set[str]) -> None:
-        self.entries = {k: v for k, v in self.entries.items() if k in live}
-        self.path.parent.mkdir(parents=True, exist_ok=True)
-        tmp = self.path.with_suffix(".tmp")
-        tmp.write_text(json.dumps(self.entries))
-        os.replace(tmp, self.path)
-
-
-def write_source_note(rel: str, meta: dict) -> str:
-    src = config.DOCS_ROOT / rel
-    text = documents.refresh_cache(rel, src)
-    size_mb = src.stat().st_size / 1024**2
-    kind = documents.kind_of(src)
-    who = meta.get("client") or "Syncthing"
-    purpose = (meta.get("purpose") or "").strip()
-    preview = (text or "")[:800].strip()
-    try:
-        rules.check_secrets(preview)
-    except rules.RuleViolation:
-        preview = ""
-    today = dt.date.today().isoformat()
-    origin = "web" if meta.get("url") else origin_of(who)
-    fm = {"kind": "source", "origin": origin, "source_kind": kind, "as_of": today, "file": rel,
-          "url": meta.get("url"),
-          "summary": purpose or f"Shared file {src.name} ({size_mb:.1f} MB), not yet distilled."}
-    body = (f"# {src.name}\n\nShared file `{rel}` ({kind}, {size_mb:.1f} MB), added by {who} on {today}."
-            + (f"\n\nPurpose: {purpose}" if purpose else "")
-            + "\n\nRead it with `read_file`, get the original with `download_link`."
-            + (f"\n\n## Preview\n\n{preview}" if preview else ""))
-    with repo.locked():
-        path = unique_path(config.VAULT_ROOT, "sources", f"{slugify(src.stem, 50)}-{origin}-{today}")
-        (config.VAULT_ROOT / f"{path}.md").write_text(render(fm, body), "utf-8")
-        repo.commit([f"{path}.md"], f"ingest: shared file {src.name} (vault-worker for {who})", "vault-worker")
-    log.info("ingested %s as %s", rel, path)
-    return path
-
-
-def _place(f: Path) -> Path:
-    month_dir = config.DOCS_ROOT / config.SHARED_REL / dt.date.today().strftime("%Y-%m")
-    month_dir.mkdir(parents=True, exist_ok=True)
-    name = sharing.safe_name(f.name)
-    target, n = month_dir / name, 2
-    while target.exists():
-        target, n = month_dir / f"{Path(name).stem}-{n}{Path(name).suffix}", n + 1
-    os.replace(f, target)
-    os.chmod(target, 0o664)
-    return target
-
-
-def process_inbox(hashes: Hashes, noted: dict[str, str]) -> None:
-    now, oldest = time.time(), 0.0
-    for inbox in sorted(p for p in config.INBOX_ROOT.iterdir() if p.is_dir() and not p.name.startswith(".")):
-        meta_file = inbox / ".meta.json"
+def process_inbox(now: float) -> float:
+    oldest = 0.0
+    for box in sorted(p for p in config.INBOX_ROOT.iterdir() if p.is_dir() and not p.name.startswith(".")):
+        meta_file = box / ".meta.json"
         meta = json.loads(meta_file.read_text()) if meta_file.exists() else {}
         results = []
-        for f in documents.walk(inbox):
+        for f in documents.walk(box):
             oldest = max(oldest, now - f.stat().st_mtime)
-            if dup := hashes.find(sha256(f)):
-                f.unlink()
-                results.append({"file": dup, "note": noted.get(dup), "duplicate": True})
-                FILES.labels("duplicate").inc()
-                continue
-            target = _place(f)
-            rel = documents.relative(target)
-            hashes.of(rel, target)
-            noted[rel] = write_source_note(rel, meta)
-            results.append({"file": rel, "note": noted[rel]})
-            FILES.labels("ingested").inc()
+            client = meta.get("client", "an agent")
+            result = filing.file(f, original_name=sharing.safe_name(f.name),
+                                 origin="web" if meta.get("url") else origin_of(client), added_by=client,
+                                 purpose=meta.get("purpose", ""), url=meta.get("url"), tags=meta.get("tags"))
+            FILED.labels("duplicate" if result["duplicate"] else "filed").inc()
+            results.append(result)
+            log.info("filed %s from %s as %s", f.name, box.name, result["note"])
         if results:
-            done = config.INBOX_ROOT / ".done" / f"{inbox.name}.json"
-            previous = json.loads(done.read_text()) if done.exists() else []
-            done.write_text(json.dumps(previous + results))
-        if now - meta.get("created", 0) > config.LINK_TTL + 600 and not any(documents.walk(inbox)):
-            for p in inbox.iterdir():
+            _record(box.name, results)
+        if now - meta.get("created", 0) > config.LINK_TTL + 600 and not any(documents.walk(box)):
+            for p in box.iterdir():
                 p.unlink()
-            inbox.rmdir()
-    INBOX_AGE.set(oldest)
+            box.rmdir()
+    return oldest
 
 
-def ingest_shared(hashes: Hashes, noted: dict[str, str]) -> set[str]:
-    """Give every file in the shared space a source note, however it arrived (Syncthing, Finder...)."""
-    live = set()
-    for p in documents.walk(config.DOCS_ROOT / config.SHARED_REL):
-        rel = documents.relative(p)
-        live.add(rel)
-        hashes.of(rel, p)
-        if rel not in noted:
-            noted[rel] = write_source_note(rel, {})
-            FILES.labels("ingested").inc()
-    return live
-
-
-def refresh_text_cache() -> None:
-    wanted = set()
-    for p in documents.walk(config.DOCS_ROOT):
-        if p.suffix.lower() not in documents.EXTRACTABLE:
+def process_drop_folder(now: float) -> float:
+    """Files dropped into Agent/inbox on any Syncthing device; left alone until they stop changing."""
+    oldest = 0.0
+    drop = config.DOCS_ROOT / config.DROP_REL
+    drop.mkdir(parents=True, exist_ok=True)
+    for f in list(documents.walk(drop)):
+        age = now - f.stat().st_mtime
+        if age < config.DROP_SETTLE_SECONDS:
             continue
-        rel = documents.relative(p)
-        cache = documents.cache_path(rel)
-        wanted.add(cache)
-        if not cache.exists() or cache.stat().st_mtime < p.stat().st_mtime:
-            documents.refresh_cache(rel, p)
-    for p in list(documents.walk(config.CACHE_ROOT / "text")):
-        if p not in wanted:
-            p.unlink()  # derived text whose document is gone
-    TEXT_FILES.set(sum(1 for p in wanted if p.stat().st_size))
+        oldest = max(oldest, age)
+        result = filing.file(f, original_name=sharing.safe_name(f.name), origin="manual", added_by="the drop folder")
+        FILED.labels("duplicate" if result["duplicate"] else "filed").inc()
+        log.info("filed dropped %s as %s", f.name, result["note"])
+    return oldest
 
 
 def run_once(cycle: int = 0) -> None:
-    for d in (config.INBOX_ROOT / ".done", config.DOCS_ROOT / config.SHARED_REL, config.CACHE_ROOT / "text"):
+    for d in (config.INBOX_ROOT / ".done", config.blobs_root(), config.CACHE_ROOT / "text"):
         d.mkdir(parents=True, exist_ok=True)
-    hashes, noted = Hashes(), Vault(config.VAULT_ROOT).files_noted()
-    process_inbox(hashes, noted)
-    hashes.save(ingest_shared(hashes, noted))
-    if cycle % TEXT_EVERY == 0:
-        refresh_text_cache()
-    SHARED_BYTES.set(sharing.usage())
+    now = time.time()
+    INBOX_AGE.set(max(process_inbox(now), process_drop_folder(now)))
+    with index.connect() as conn:
+        index.sync_vault(conn)
+        if cycle % DOCUMENTS_EVERY == 0:
+            index.sync_documents(conn, extract=True)
+            documents.prune_text_cache(index.known_hashes(conn))
+        for scope, n in conn.execute("SELECT scope, count(*) FROM items GROUP BY scope"):
+            INDEXED.labels(scope).set(n)
+    STORED_BYTES.set(sharing.usage())
     LAST_RUN.set(time.time())
 
 

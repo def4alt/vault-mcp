@@ -9,18 +9,30 @@ from pathlib import Path
 
 env = os.environ.get
 
-# Storage
+# Storage. The vault (git) holds notes and file notes; blobs/ holds the files themselves
+# (content-addressed, not in git). Documents are read-only. The cache is derived and rebuildable.
 VAULT_ROOT = Path(env("VAULT_ROOT", "/vault"))
-DOCS_ROOT = Path(env("DOCS_ROOT", "/documents"))  # read everything; the worker writes the shared space
-INBOX_ROOT = Path(env("INBOX_ROOT", "/inbox"))  # DOCS_ROOT/.inbox, mounted separately where needed
-CACHE_ROOT = Path(env("CACHE_ROOT", "/cache"))  # derived text; safe to delete
-SHARED_REL = env("SHARED_REL", "Agent/shared")
+DOCS_ROOT = Path(env("DOCS_ROOT", "/documents"))
+INBOX_ROOT = Path(env("INBOX_ROOT", "/inbox"))  # HTTP uploads and fetches land here
+CACHE_ROOT = Path(env("CACHE_ROOT", "/cache"))  # text extracts + SQLite index
+DROP_REL = env("DROP_REL", "Agent/inbox")  # Syncthing drop folder inside the documents tree
 
-# File links (nginx verifies them) and limits
+
+def blobs_root() -> Path:
+    return VAULT_ROOT / "blobs"
+
+
+def index_path() -> Path:
+    return CACHE_ROOT / "index.sqlite"
+
+
+# Links (nginx verifies them) and limits
 FILES_BASE_URL = env("FILES_BASE_URL", "http://localhost:8080").rstrip("/")
+NOTES_BASE_URL = env("NOTES_BASE_URL", "http://localhost:3000").rstrip("/")  # SilverBullet, for citations
 LINK_SECRET = env("LINK_SECRET", "")
 LINK_TTL = int(env("LINK_TTL_SECONDS", "3600"))
-QUOTA_BYTES = int(env("SHARED_QUOTA_BYTES", str(30 * 1024**3)))
+CITATION_TTL = int(env("CITATION_TTL_SECONDS", str(7 * 86400)))  # document links handed out as citations
+QUOTA_BYTES = int(env("FILES_QUOTA_BYTES", str(30 * 1024**3)))
 FETCH_MAX_BYTES = int(env("FETCH_MAX_BYTES", str(1024**3)))
 
 # MCP server and auth
@@ -36,3 +48,4 @@ TAILNET_HOSTS = set(filter(None, env("TAILNET_HOSTS", "").split(",")))
 
 # Worker
 WORKER_INTERVAL = int(env("WORKER_INTERVAL_SECONDS", "10"))
+DROP_SETTLE_SECONDS = int(env("DROP_SETTLE_SECONDS", "30"))  # leave files Syncthing is still writing

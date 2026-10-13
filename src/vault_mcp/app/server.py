@@ -8,22 +8,28 @@ from starlette.responses import PlainTextResponse
 
 from .. import config
 from .auth import Gatekeeper, build_auth
-from .files import shared_files
+from .files import files
 from .guidance import guidance
-from .notes import notes
+from .knowledge import knowledge
+from .review import review
+from .widgets import widgets
 
+# Hosts may only read the first 512 characters: the essentials come first.
 INSTRUCTIONS = (
-    "Andrii's personal knowledge vault and documents. You are a trusted collaborator with full read access "
-    "and broad write access: capture what you learn, keep the knowledge graph tidy, and share files with the "
-    "other agents (Claude, ChatGPT, Hermes) through the shared space. Read AGENTS first (`read('AGENTS')`) "
-    "for the conventions. Every change is a git commit: inspect with `history`, undo with `revert`, and "
-    "record what you did with `append_log`."
+    "Andrii's knowledge vault (Markdown + git) and his documents. Start with `search` (scope notes|sources|files|"
+    "documents, filters like tags or links_to), then `fetch` an id. Change things with `save` (many pages, one commit),"
+    " `move`, `delete`; every change is a commit you can `revert`. Files: `request_upload`, `save_from_url`, "
+    "`share_file`, `get_link`. Conventions: fetch('AGENTS'). Record work with `log`.\n\n"
+    "You are a trusted collaborator with broad write access, working alongside other agents (Claude, ChatGPT, "
+    "Hermes) in the same vault. Capture what you learn, keep the graph tidy, describe and tag files you add, and "
+    "check `history` before large changes. Hard limits: no secrets in the vault, sources stay as captured, "
+    "frontmatter must match the schema (vault://schema)."
 )
 
 
 def build() -> FastMCP:
     server = FastMCP("vault", instructions=INSTRUCTIONS, auth=build_auth(), middleware=[Gatekeeper()])
-    for group in (notes, shared_files, guidance):
+    for group in (knowledge, files, review, widgets, guidance):
         server.mount(group)
 
     @server.custom_route("/healthz", methods=["GET"])

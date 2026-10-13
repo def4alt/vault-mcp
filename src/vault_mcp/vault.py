@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import datetime as dt
 import re
+import secrets
 import unicodedata
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -11,11 +12,11 @@ import yaml
 
 WIKILINK = re.compile(r"(!?)\[\[([^\]|#]+)(?:#[^\]|]*)?(?:\|[^\]]*)?\]\]")
 LINK_FIELDS = ("source", "about", "related", "supersedes", "projects")
-PAGE_DIRS = ("notes", "sources", "projects")
+PAGE_DIRS = ("notes", "sources", "projects", "files", "handoffs")
 DATE_KEYS = ("as_of", "reviewed", "review")
-FIELD_ORDER = ["kind", "status", "as_of", "reviewed", "categories", "origin", "source_kind", "file", "url",
-               "source", "about", "related", "supersedes", "projects", "rating", "area", "review",
-               "tags", "aliases", "summary"]
+FIELD_ORDER = ["id", "kind", "status", "as_of", "reviewed", "to", "from", "categories", "tags", "origin", "source_kind",
+               "blob", "media", "mime", "size", "original_name", "sha256", "url", "source", "about", "related",
+               "supersedes", "projects", "refs", "mentions", "rating", "area", "review", "aliases", "summary"]
 
 
 @dataclass
@@ -29,6 +30,11 @@ class Page:
     @property
     def kind(self) -> str | None:
         return self.meta.get("kind")
+
+    @property
+    def sid(self) -> str | None:
+        """The page's stable id (frontmatter `id`), which survives renames."""
+        return str(self.meta["id"]) if self.meta.get("id") else None
 
     @property
     def title(self) -> str:
@@ -79,6 +85,14 @@ def as_date(value) -> dt.date | None:
         return None
 
 
+ID_ALPHABET = "abcdefghjkmnpqrstvwxyz23456789"  # no look-alikes (i/l/1, o/0, u/v)
+
+
+def new_id() -> str:
+    """A short random stable id for a page, e.g. `k7m2qx9p`."""
+    return "".join(secrets.choice(ID_ALPHABET) for _ in range(8))
+
+
 def slugify(text: str, max_len: int = 80) -> str:
     text = unicodedata.normalize("NFKD", text).encode("ascii", "ignore").decode().replace("'", "")
     slug = re.sub(r"[^a-z0-9]+", "-", text.lower()).strip("-")
@@ -92,21 +106,27 @@ def unique_path(root: Path, folder: str, base: str) -> str:
     return path
 
 
+def read_page(root: Path, path: str) -> Page:
+    """Parse one page ("notes/x") with its frontmatter, outgoing links and embeds."""
+    meta, body = split_frontmatter((root / f"{path}.md").read_text(encoding="utf-8"))
+    page = Page(path, meta, body)
+    for name in LINK_FIELDS:
+        page.links.update(page.field_links(name))
+    for m in WIKILINK.finditer(body):
+        (page.embeds if m.group(1) else page.links).add(m.group(2).strip())
+    return page
+
+
+def page_paths(root: Path) -> list[str]:
+    return [f"{d}/{f.stem}" for d in PAGE_DIRS for f in sorted((root / d).glob("*.md"))]
+
+
 class Vault:
     """Read-only snapshot of the pages and their link graph."""
 
     def __init__(self, root: Path):
         self.root = root
-        self.pages: dict[str, Page] = {}
-        for d in PAGE_DIRS:
-            for f in sorted((root / d).glob("*.md")):
-                meta, body = split_frontmatter(f.read_text(encoding="utf-8"))
-                page = Page(f"{d}/{f.stem}", meta, body)
-                for name in LINK_FIELDS:
-                    page.links.update(page.field_links(name))
-                for m in WIKILINK.finditer(body):
-                    (page.embeds if m.group(1) else page.links).add(m.group(2).strip())
-                self.pages[page.path] = page
+        self.pages: dict[str, Page] = {p: read_page(root, p) for p in page_paths(root)}
 
     def exists(self, target: str) -> bool:
         return target in self.pages or (self.root / target).exists() or (self.root / f"{target}.md").exists()
@@ -121,7 +141,7 @@ class Vault:
                 out.setdefault(t, []).append(p.path)
         return out
 
-    def files_noted(self) -> dict[str, str]:
-        """Shared file path -> source note describing it (`file:` frontmatter)."""
-        return {str(p.meta["file"]): p.path for p in self.pages.values()
-                if p.path.startswith("sources/") and p.meta.get("file")}
+    def file_note_for(self, sha256: str) -> str | None:
+        """The file note describing the blob with this content hash, if any."""
+        return next((p.path for p in self.pages.values()
+                     if p.path.startswith("files/") and p.meta.get("sha256") == sha256), None)

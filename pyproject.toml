@@ -1,6 +1,6 @@
 [project]
 name = "vault-mcp"
-version = "0.2.0"
+version = "0.3.0"
 description = "MCP server for a personal Markdown knowledge vault"
 readme = "README.md"
 authors = [
@@ -17,6 +17,7 @@ dependencies = [
 vault-mcp = "vault_mcp.app.server:main"
 vault-lint = "vault_mcp.lint:main"
 vault-worker = "vault_mcp.worker:main"
+vault-index = "vault_mcp.index:main"
 
 [build-system]
 requires = ["uv_build>=0.11.18,<0.12.0"]

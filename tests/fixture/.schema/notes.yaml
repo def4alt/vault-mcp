@@ -1,4 +1,4 @@
-# Frontmatter schema for notes/*.md and sources/*.md, enforced by scripts/lint.py.
+# Frontmatter schema for notes/, sources/, projects/ and files/. Checked by the vault server and lint.
 categories: [studies, careers, systems, agents, products, research, places,
              experiences, wellness, gear, finances, administration, preferences]
 
@@ -10,7 +10,7 @@ notes:
     as_of:      {type: date}
     reviewed:   {type: date}
     categories: {type: list, items: category}
-    source:     {type: list, items: link, prefix: "sources/"}
+    source:     {type: list, items: link, prefix: ["sources/", "files/"]}
     about:      {type: list, items: link}
     related:    {type: list, items: link}
     supersedes: {type: list, items: link}
@@ -20,18 +20,16 @@ notes:
     summary:    {type: str}
     tags:       {type: list}
     aliases:    {type: list}
-  rules:
-    - facts need status and as_of
 
 sources:
   required: [kind, origin, source_kind, as_of, summary]
   fields:
     kind:        {enum: [source]}
     origin:      {enum: [claude, chatgpt, hermes, manual, web]}
-    source_kind: {enum: [snapshot, chat-export, clipping, document, web-page, video, audio, image, data]}
-    file:        {type: str}
+    source_kind: {enum: [snapshot, chat-export, clipping, document, web-page]}
     as_of:       {type: date}
     categories:  {type: list, items: category}
+    tags:        {type: list}
     summary:     {type: str}
     url:         {type: str}
 
@@ -43,4 +41,26 @@ projects:
     area:       {type: str}
     review:     {type: date}
     categories: {type: list, items: category}
+    tags:       {type: list}
     summary:    {type: str}
+
+# One note per stored file. The file itself is blobs/<sha256[:16]>.<ext>, never renamed.
+files:
+  required: [kind, blob, sha256, as_of, summary]
+  fields:
+    kind:          {enum: [file]}
+    blob:          {type: str}
+    sha256:        {type: str}
+    media:         {enum: [document, video, audio, image, data]}
+    mime:          {type: str}
+    size:          {type: int, min: 0}
+    original_name: {type: str}
+    origin:        {enum: [claude, chatgpt, hermes, manual, web]}
+    url:           {type: str}
+    as_of:         {type: date}
+    categories:    {type: list, items: category}
+    tags:          {type: list}
+    about:         {type: list, items: link}
+    related:       {type: list, items: link}
+    projects:      {type: list, items: link, prefix: "projects/"}
+    summary:       {type: str}

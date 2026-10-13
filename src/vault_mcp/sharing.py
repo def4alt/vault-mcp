@@ -26,23 +26,30 @@ def safe_name(name: str) -> str:
     return (name or "file")[:120]
 
 
-# --- signed links: nginx secure_link_md5 "$secure_link_expires<uri> <secret>" -------
+# --- signed links: nginx secure_link_md5 "$secure_link_expires$uri$arg_n $link_secret" ---
+# /d/<path> documents, /b/<blob>?n=<name> vault blobs (served under their original name), /u/<id>/ uploads.
 
-def _signature(uri: str, expires: int) -> str:
+def _signature(uri: str, expires: int, name: str = "") -> str:
     if not config.LINK_SECRET:
         raise DocumentError("file links are not configured on this server")
-    digest = hashlib.md5(f"{expires}{uri} {config.LINK_SECRET}".encode()).digest()
+    digest = hashlib.md5(f"{expires}{uri}{name} {config.LINK_SECRET}".encode()).digest()
     return base64.urlsafe_b64encode(digest).decode().rstrip("=")
 
 
-def _signed(uri: str, ttl: int | None, suffix: str = "") -> tuple[str, int]:
+def _signed(uri: str, ttl: int | None, suffix: str = "", name: str | None = None) -> tuple[str, int]:
     expires = int(time.time()) + (ttl or config.LINK_TTL)
-    query = urllib.parse.urlencode({"e": expires, "s": _signature(uri, expires)})
+    encoded_name = urllib.parse.quote(name, safe="") if name else ""  # nginx signs $arg_n as sent
+    params = {"e": expires, "s": _signature(uri, expires, encoded_name)}
+    query = urllib.parse.urlencode(params) + (f"&n={encoded_name}" if encoded_name else "")
     return f"{config.FILES_BASE_URL}{urllib.parse.quote(uri)}{suffix}?{query}", expires
 
 
-def download_link(rel: str, ttl: int | None = None) -> tuple[str, int]:
+def document_link(rel: str, ttl: int | None = None) -> tuple[str, int]:
     return _signed("/d/" + rel.lstrip("/"), ttl)
+
+
+def blob_link(blob: str, original_name: str, ttl: int | None = None) -> tuple[str, int]:
+    return _signed("/b/" + blob.removeprefix("blobs/"), ttl, name=original_name)
 
 
 def upload_link(upload_id: str, ttl: int | None = None) -> tuple[str, int]:
@@ -51,13 +58,14 @@ def upload_link(upload_id: str, ttl: int | None = None) -> tuple[str, int]:
 
 # --- the inbox: one directory per upload or fetch -----------------------------------
 
-def open_upload(client: str, purpose: str, url: str | None = None) -> tuple[str, Path]:
+def open_upload(client: str, purpose: str, url: str | None = None, tags: list[str] | None = None) -> tuple[str, Path]:
+    """An inbox directory with metadata; uploads and fetches land in it, the worker files them."""
     slug = re.sub(r"[^a-z0-9]+", "-", client.lower()).strip("-")[:24] or "agent"
     upload_id = f"{slug}-{secrets.token_hex(6)}"
     inbox = config.INBOX_ROOT / upload_id
     inbox.mkdir(parents=True, mode=0o2775)
-    (inbox / ".meta.json").write_text(json.dumps(
-        {"client": client, "purpose": purpose, "url": url, "created": int(time.time())}))
+    (inbox / ".meta.json").write_text(json.dumps({"client": client, "purpose": purpose, "url": url,
+                                                  "tags": tags or [], "created": int(time.time())}))
     return upload_id, inbox
 
 
@@ -68,7 +76,7 @@ def upload_status(upload_id: str) -> dict:
     inbox = config.INBOX_ROOT / upload_id
     return {
         "id": upload_id,
-        "ingested": json.loads(done.read_text()) if done.exists() else [],
+        "filed": json.loads(done.read_text()) if done.exists() else [],
         "waiting": [p.name for p in walk(inbox)] if inbox.exists() else [],
     }
 
@@ -77,19 +85,18 @@ def wait_until_ingested(upload_id: str, seconds: float = 45) -> dict:
     deadline = time.time() + seconds
     while True:
         status = upload_status(upload_id)
-        if (status["ingested"] and not status["waiting"]) or time.time() > deadline:
+        if (status["filed"] and not status["waiting"]) or time.time() > deadline:
             return status
         time.sleep(1.5)
 
 
 def usage() -> int:
-    roots = (config.DOCS_ROOT / config.SHARED_REL, config.INBOX_ROOT)
-    return sum(p.stat().st_size for root in roots for p in walk(root))
+    return sum(p.stat().st_size for root in (config.blobs_root(), config.INBOX_ROOT) for p in walk(root))
 
 
 def check_quota() -> None:
     if usage() > config.QUOTA_BYTES:
-        raise DocumentError(f"the shared space is over its {config.QUOTA_BYTES // 1024**3} GB quota")
+        raise DocumentError(f"stored files are over the {config.QUOTA_BYTES // 1024**3} GB quota")
 
 
 # --- fetching: public addresses only (the pod's egress policy enforces it too) ------
