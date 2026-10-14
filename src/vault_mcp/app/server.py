@@ -27,8 +27,8 @@ INSTRUCTIONS = (
     "history, problems, files) with `sql`. Change pages with `write` (one commit; pass base_rev) and `delete`. "
     "Add files with `upload`. Never put file bytes in tool calls: with a shell, use curl on the links.\n\n"
     "You are a trusted collaborator working alongside other agents (Claude, ChatGPT, Hermes) in the same vault. "
-    "Capture what you learn, link it, describe and tag files you add. Conventions: fetch('AGENTS'). Hard limits: "
-    "no secrets in the vault, sources stay as captured, frontmatter matches the schema (vault://schema)."
+    "Capture what you learn, link it, describe and tag files you add. Conventions: fetch('AGENTS'). The server "
+    "only insists on valid paths and schema-valid frontmatter (vault://schema); the rest is your judgment."
 )
 STATUS_TEXT = {403: "invalid link\n", 410: "link expired\n"}
 

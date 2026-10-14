@@ -258,7 +258,7 @@ def write(changes: list[Change], message: str, ctx: Context, idempotency_key: st
             return replay
         overlay, direct = _plan(changes)
         for path in sorted(direct):
-            rules.check_write(path, overlay[path], _read(path), schema)
+            rules.check_write(path, overlay[path], schema)
         for path, text in overlay.items():
             f = config.VAULT_ROOT / path
             if text is None:
@@ -306,7 +306,6 @@ def delete(paths: list[str], message: str, ctx: Context, idempotency_key: str | 
             old = _read(path)
             if old is None:
                 raise ToolError(f"cannot delete `{path}`: it does not exist")
-            rules.check_write(path, None, old, {})
             pages.append(path)
         for path in pages:
             (config.VAULT_ROOT / path).unlink()

@@ -160,10 +160,10 @@ async def test_sql_is_read_only_single_statement_and_bounded(env, monkeypatch):
 async def test_a_batch_is_one_commit_or_nothing(env):
     root, _ = env
     before = commits(root)
-    with pytest.raises(ToolError, match="credential"):
+    with pytest.raises(ToolError, match="frontmatter does not match"):
         await call("write", message="ingest", changes=[
             {"path": "notes/acme", "content": ENTITY},
-            {"path": "notes/leak", "content": ENTITY.replace("# Acme", "password: hunter2hunter2")}])
+            {"path": "notes/bad", "content": ENTITY.replace("kind: entity", "kind: nonsense")}])
     assert not (root / "notes/acme.md").exists() and commits(root) == before
     result = await call("write", message="ingest", changes=[
         {"path": "notes/acme", "content": ENTITY}, {"path": "notes/i-work-at-acme", "content": FACT}])
@@ -206,12 +206,16 @@ async def test_move_rewrites_links_and_patches_touch_only_frontmatter(env):
     assert "[[notes/acme-corp]]" in fact and "status: confirmed" in fact and fact.endswith("# I work at Acme\n")
 
 
-async def test_sources_stay_as_captured(env):
+async def test_content_is_never_screened_and_sources_can_be_corrected(env):
     source = ("---\nkind: source\norigin: manual\nsource_kind: snapshot\nas_of: 2026-10-12\nsummary: s\n---\n"
-              "# Snapshot\n")
-    await write("sources/snap", source)
-    with pytest.raises(ToolError, match="stay as captured"):
-        await write("sources/snap", source.replace("Snapshot", "Rewritten"))
+              "# Snapshot\n\nCall +49 151 55435105 or see [[topics]]\n")
+    first = await write("sources/snap", source)  # a phone number that passes the card checksum
+    assert "+49 151 55435105" in (await call("fetch", id="sources/snap")).text
+    fixed = source.replace("[[topics]]", "[[notes/topics]]")
+    await write("sources/snap", fixed, base_rev=first.revs["sources/snap.md"])
+    assert "[[notes/topics]]" in (await call("fetch", id="sources/snap")).text
+    await call("write", message="notes", changes=[{"path": "notes/pw", "content": ENTITY.replace(
+        "# Acme", "# Wifi\n\npassword: hunter2hunter2")}])
 
 
 async def test_delete_removes_pages_and_only_files_nothing_refers_to(env):

@@ -13,7 +13,7 @@ import re
 import shutil
 from pathlib import Path
 
-from . import config, documents, index, repo, rules
+from . import config, documents, index, repo
 from .vault import render, slugify, split_frontmatter, unique_path
 
 
@@ -67,10 +67,6 @@ def file(src: Path, *, original_name: str, origin: str, added_by: str, purpose: 
     blob = store_blob(src, sha, original_name)
     text = documents.text_for(config.VAULT_ROOT / blob, sha)
     preview = (text or "")[:800].strip()
-    try:
-        rules.check_secrets(preview)
-    except rules.RuleViolation:
-        preview = ""
     today = dt.date.today().isoformat()
     size_label = f"{size / 1024**2:.1f} MB" if size >= 1024**2 else f"{size / 1024:.0f} KB"
     meta = {
