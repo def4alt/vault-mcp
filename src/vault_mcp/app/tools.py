@@ -19,7 +19,7 @@ from fastmcp import Context, FastMCP
 from fastmcp.exceptions import ToolError
 from mcp import types as mt
 
-from .. import config, documents, filing, incoming, index, repo, rules, signing
+from .. import config, documents, filing, incoming, index, pages, repo, rules, signing
 from ..vault import DATE_KEYS, PAGE_DIRS, render, split_frontmatter
 from .auth import author, client_name
 from .models import (
@@ -100,8 +100,9 @@ def _page(text: str, offset: int) -> tuple[str, dict]:
 def fetch(id: str, offset: int = 0) -> Document:
     """Full text of anything search or sql returned: a page (notes/x, files/x, AGENTS, index, views/x),
     a page's stable uid, a document (doc:University/x.pdf), or an old version (notes/x@<commit>).
-    File notes include the extracted text of their file and a download_url. metadata.rev is what
-    you pass as base_rev to write. Long texts continue at metadata.next_offset."""
+    File notes include the extracted text of their file and a download_url; HTML file notes (pages)
+    also a view_url, which is their url. metadata.rev is what you pass as base_rev to write. Long texts
+    continue at metadata.next_offset."""
     item_id = id.strip().lstrip("/")
     if item_id.startswith("doc:"):
         p = documents.resolve(item_id.removeprefix("doc:"))
@@ -138,12 +139,15 @@ def fetch(id: str, offset: int = 0) -> Document:
         blob = config.VAULT_ROOT / str(fm["blob"])
         if blob.exists():
             meta["download_url"] = signing.blob_link(str(fm["blob"]), str(fm.get("original_name") or blob.name))
+            if pages.is_page(fm) and (view := pages.url(item_id)):
+                meta["view_url"] = view
             extracted = documents.text_for(blob, str(fm.get("sha256") or documents.sha256_of(blob)))
             if extracted:
                 text += "\n\n## Extracted text\n\n" + extracted
     title = (re.search(r"^# (.+)$", body, re.M) or [None, item_id])[1]
     page, more = _page(text, offset)
-    return Document(id=item_id, title=title, text=page, url=_url(item_id), metadata={**meta, **more})
+    return Document(id=item_id, title=title, text=page, url=meta.get("view_url") or _url(item_id),
+                    metadata={**meta, **more})
 
 
 @vault.tool(annotations=_annotations("Query the index with SQL", read_only=True))
@@ -152,7 +156,8 @@ def sql(sql: str, params: list[Any] | None = None, limit: int = 100, cursor: str
     notes(id=path, uid, folder, kind, status, title, summary, tags JSON, as_of, reviewed, blob, sha256, rev,
     mtime, size, fm=frontmatter JSON); documents(id 'doc:<path>', path, folder, name, media, mime, size);
     links(src, dst, field: body|embed|source|about|related|supersedes|projects); tags(id, tag);
-    facets(id, field, value); files(id, name, mime, size, tags, summary, blob, url=download link);
+    facets(id, field, value); files(id, name, mime, size, tags, summary, blob, url=download link,
+    view=page URL of an HTML file);
     fts(id, title, summary, body): FTS5 incl. text inside files; commits(sha, date, author, message);
     commit_files(sha, id); problems(kind, id, detail). link(blob_or_doc_id) signs a download URL.
     E.g. SELECT src FROM links WHERE dst = 'notes/acme' | SELECT id FROM tags WHERE tag = 'slides' |
@@ -272,6 +277,12 @@ def write(changes: list[Change], message: str, ctx: Context, idempotency_key: st
                                          for p, t in overlay.items()})
 
 
+def _refers(text: str | None, blob: str) -> bool:
+    """Whether a file note's frontmatter names blob as its file or one of its earlier versions."""
+    meta = split_frontmatter(text or "")[0]
+    return meta.get("blob") == blob or blob in (meta.get("versions") or [])
+
+
 @vault.tool(annotations=_annotations("Delete pages or unused files", read_only=False, destructive=True))
 def delete(paths: list[str], message: str, ctx: Context, idempotency_key: str | None = None) -> WriteResult:
     """Delete pages that are wrong or redundant, in one commit (history keeps them: fetch("x@<commit>")
@@ -297,9 +308,9 @@ def delete(paths: list[str], message: str, ctx: Context, idempotency_key: str | 
                 blob = raw.strip().lstrip("/")
                 if not signing.BLOB.fullmatch(blob.removeprefix("blobs/")) or not (config.VAULT_ROOT / blob).is_file():
                     raise ToolError(f"no file `{blob}`")
-                if note := next((p for p in _pages() if p.startswith("files/") and
-                                 split_frontmatter(_read(p) or "")[0].get("blob") == blob), None):
-                    raise ToolError(f"`{blob}` is described by {note.removesuffix('.md')}; delete that note first")
+                if note := next((p for p in _pages() if p.startswith("files/") and _refers(_read(p), blob)), None):
+                    raise ToolError(f"`{blob}` belongs to {note.removesuffix('.md')}; delete that note, or drop "
+                                    "the blob from its versions, first")
                 blobs.append(blob)
                 continue
             path = rules.normalise_path(raw)
@@ -321,7 +332,7 @@ def delete(paths: list[str], message: str, ctx: Context, idempotency_key: str | 
 @vault.tool(annotations=_annotations("Add files to the vault", read_only=False, idempotent=False, open_world=True),
             meta={"openai/fileParams": ["file"]})
 async def upload(ctx: Context, purpose: str = "", tags: list[str] | None = None, url: str | None = None,
-                 file: FileRef | None = None, filename: str = "file.pdf") -> UploadResult:
+                 file: FileRef | None = None, filename: str = "file.pdf", replaces: str | None = None) -> UploadResult:
     """Bring a file into the vault; it becomes a file note (files/<name>) that you then describe, tag and
     link. File bytes never go through this call:
     - a public URL: pass url; the server downloads and files it, and returns the note.
@@ -329,17 +340,25 @@ async def upload(ctx: Context, purpose: str = "", tags: list[str] | None = None,
     - a file in your sandbox or on your machine: call with filename only, then run the returned curl
       (or PUT to put_url with {filename} replaced). The response of each PUT names the note. One link
       takes many files for an hour; it needs network access to this server.
-    purpose and tags go into the file note. Already-stored content is recognised (duplicate)."""
+    purpose and tags go into the file note. Already-stored content is recognised (duplicate).
+    replaces="files/<name>": the file becomes the new version of that note instead (same note, same
+    view_url; the earlier blob is kept in its `versions`). An HTML file is a page: the result has its
+    view_url, a stable link to open it in a browser. Conventions for pages: fetch("AGENTS")."""
     who = client_name(ctx)
+    if replaces is not None:
+        replaces = rules.normalise_path(replaces).removesuffix(".md")
+        meta = split_frontmatter(_read(f"{replaces}.md") or "")[0]
+        if not replaces.startswith("files/") or meta.get("kind") != "file":
+            raise ToolError(f"`{replaces}` is not a file note; replaces takes files/<name>")
     await anyio.to_thread.run_sync(incoming.check_quota)
     if file is not None or url:
         source = file.download_url if file is not None else url
         part, name = await anyio.to_thread.run_sync(incoming.fetch, source, file.file_name if file else None)
         result = await anyio.to_thread.run_sync(partial(
             filing.file, part, original_name=name, origin=filing.origin_of(who) if file else "web",
-            added_by=who, purpose=purpose, url=None if file else url, tags=tags))
-        return UploadResult(note=result["note"], duplicate=result["duplicate"])
-    ticket = incoming.open_ticket(who, purpose, tags)
+            added_by=who, purpose=purpose, url=None if file else url, tags=tags, replaces=replaces))
+        return UploadResult(note=result["note"], duplicate=result["duplicate"], view_url=pages.view_url(result["note"]))
+    ticket = incoming.open_ticket(who, purpose, tags, replaces)
     template, expires = signing.upload_link(ticket)
     target = template.replace("{filename}", urllib.parse.quote(documents.safe_name(filename), safe=""))
     return UploadResult(put_url=template, curl=f"curl -fsS -T {shlex.quote(filename)} {shlex.quote(target)}",

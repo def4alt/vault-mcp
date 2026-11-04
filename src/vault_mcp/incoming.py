@@ -27,12 +27,13 @@ def _root() -> Path:
     return root
 
 
-def open_ticket(client: str, purpose: str, tags: list[str] | None) -> str:
-    """An upload ticket: what the files are for, who brings them. Its id goes into the signed PUT link."""
+def open_ticket(client: str, purpose: str, tags: list[str] | None, replaces: str | None = None) -> str:
+    """An upload ticket: what the files are for, who brings them, and the file note they replace, if any.
+    Its id goes into the signed PUT link."""
     slug = re.sub(r"[^a-z0-9]+", "-", client.lower()).strip("-")[:24] or "agent"
     ticket = f"{slug}-{secrets.token_hex(6)}"
     (_root() / f"{ticket}.json").write_text(json.dumps(
-        {"client": client, "purpose": purpose, "tags": tags or [], "created": int(time.time())}))
+        {"client": client, "purpose": purpose, "tags": tags or [], "replaces": replaces, "created": int(time.time())}))
     return ticket
 
 

@@ -26,7 +26,7 @@ cache/                     derived, rebuildable: index.sqlite + text/<sha256>.tx
 | `sql(sql, params)` | Read-only SQLite over `notes`, `documents`, `links`, `tags`, `files`, `fts`, `commits`, `commit_files`, `problems`; `link()` signs download URLs |
 | `write(changes, message)` | Create, replace, frontmatter-patch or move pages as one commit; `base_rev` per change, `idempotency_key` per call |
 | `delete(paths, message)` | Pages (history keeps them) and blobs no note refers to; the only destructive tool |
-| `upload(...)` | A URL or a ChatGPT attachment is pulled and filed; otherwise a signed PUT link plus a ready `curl` |
+| `upload(...)` | A URL or a ChatGPT attachment is pulled and filed; otherwise a signed PUT link plus a ready `curl`. `replaces="files/x"` files a new version of that note |
 
 `sql` runs on a separate `mode=ro` connection with `query_only`, an authorizer (SELECT/WITH and a few
 read-only pragmas), a time limit, row paging and clipped cells. Lint findings and review queues are just
@@ -45,6 +45,22 @@ fetch / sql link() ─▶ https://…/f/<blob>/<name>?e&s ─▶ Caddy asks /_ve
 
 Links are HMAC-SHA256 over the path scope and expiry (`signing.py`); `/_verify` is Caddy's `forward_auth`.
 
+## Pages
+
+An HTML file note is a page: a person opens it at a stable URL on its own host, `PAGES_URL/<name>/`.
+`upload(..., replaces="files/<name>")` files a new version under the same note, so the URL stays; the
+earlier blobs stay in the note's `versions` (lint and `delete` treat them as referenced). `fetch`, `upload`
+and the `files` table give the URL (`view_url`, `view`).
+
+```
+browser ─▶ PAGES_URL/<name>/ ─▶ Caddy asks /_page ─▶ X-Blob: <hash>.html ─▶ Caddy serves the blob
+browser ─▶ PAGES_URL/        ─▶ Caddy proxies /_pages (the index, newest first)
+```
+
+The pages host is meant for the tailnet only (`tailscale serve`), and Caddy sends every page with a CSP
+`sandbox` without `allow-same-origin`: each page runs in an opaque origin, with no cookies, storage or
+access to other pages or this server. `/_page` and `/_pages` are not routed on the public host.
+
 ## Code
 
 ```
@@ -57,10 +73,11 @@ vault_mcp/
   index.py      infra:  the SQLite index (agents' data model) and the read-only SQL runner, `vault-index`
   signing.py    infra:  signed download and upload links, verification
   incoming.py   infra:  upload tickets, streamed bodies, fetching public URLs, quota
-  filing.py     service: any incoming file -> blob + file note + commit + index
+  filing.py     service: any incoming file -> blob + file note + commit + index; new versions of a file
+  pages.py      service: HTML file notes as pages: which blob a page URL shows, the index
   worker.py     interface: `vault-worker` (drop folder, autocommit, index, lint, push, pruning)
   app/          interface: the MCP server
-    server.py     composition root: instructions, auth, HTTP routes (/u PUT, /_verify, /healthz)
+    server.py     composition root: instructions, auth, HTTP routes (/u PUT, /_verify, /_page, /_pages, /healthz)
     auth.py       GitHub OAuth (allow-listed logins, consent) + named API keys, metrics, error mapping
     tools.py      the six tools and the two resources
     models.py     typed results (output schemas)
@@ -72,6 +89,7 @@ vault_mcp/
 |---|---|
 | `VAULT_ROOT`, `DOCS_ROOT`, `CACHE_ROOT`, `DROP_REL` | Vault repo, documents, derived cache, drop folder |
 | `PUBLIC_URL`, `NOTES_BASE_URL`, `LINK_SECRET` | This server's URL (MCP, OAuth, links), SilverBullet for citations, the link key |
+| `PAGES_URL` | The pages host, where a person views HTML file notes (empty = no page URLs) |
 | `GITHUB_CLIENT_ID`, `GITHUB_CLIENT_SECRET`, `JWT_SIGNING_KEY`, `ALLOWED_GITHUB_LOGINS` | OAuth |
 | `API_KEYS` | `name=key,…` for headless agents; the name is their identity in commits |
 | `FILES_QUOTA_BYTES`, `UPLOAD_MAX_BYTES`, `FETCH_MAX_BYTES`, `LINK_TTL_SECONDS`, `CITATION_TTL_SECONDS`, `SQL_TIMEOUT_SECONDS` | Limits |
@@ -81,6 +99,7 @@ vault_mcp/
 ## Development
 
 ```bash
-uvx ruff check src tests
-uv run pytest
+mise install        # uv, pinned in mise.toml
+mise exec -- uvx ruff check src tests
+mise exec -- uv run pytest
 ```

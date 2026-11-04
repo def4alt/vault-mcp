@@ -51,6 +51,7 @@ files:
     kind:          {enum: [file]}
     blob:          {type: str}
     sha256:        {type: str}
+    versions:      {type: list}      # earlier blobs of this file, newest first (upload replaces=...)
     media:         {enum: [document, video, audio, image, data]}
     mime:          {type: str}
     size:          {type: int, min: 0}

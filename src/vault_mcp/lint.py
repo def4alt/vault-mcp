@@ -122,6 +122,7 @@ def lint(vault: Vault, today: dt.date | None = None) -> list[Problem]:
     for p in vault.pages.values():
         if p.path.startswith("files/") and p.meta.get("blob"):
             referenced.add(str(p.meta["blob"]))
+            referenced.update(str(b) for b in p.meta.get("versions") or [])
             if not (vault.root / str(p.meta["blob"])).exists():
                 out.append(Problem("blob", p.path, f"its blob `{p.meta['blob']}` is missing"))
     blob_dir = vault.root / "blobs"

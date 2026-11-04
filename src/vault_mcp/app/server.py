@@ -3,6 +3,8 @@
     /mcp              MCP (Streamable HTTP), OAuth routes next to it
     /u/<ticket>/<n>   PUT an upload (signed link); answers with the file note as JSON
     /_verify          Caddy's forward_auth check for /f and /d downloads, which Caddy serves from disk
+    /_page            Caddy's forward_auth check on the pages host: which blob /<name>/ shows (pages.py)
+    /_pages           the pages host's index
     /healthz
 """
 from __future__ import annotations
@@ -14,9 +16,9 @@ import anyio
 from fastmcp import FastMCP
 from prometheus_client import start_http_server
 from starlette.requests import Request
-from starlette.responses import JSONResponse, PlainTextResponse, Response
+from starlette.responses import HTMLResponse, JSONResponse, PlainTextResponse, Response
 
-from .. import config, documents, filing, incoming, signing
+from .. import config, documents, filing, incoming, pages, signing
 from .auth import Gatekeeper, build_auth
 from .tools import vault
 
@@ -44,6 +46,18 @@ async def verify(request: Request) -> Response:
     return Response(STATUS_TEXT.get(status), status_code=status)
 
 
+async def page(request: Request) -> Response:
+    """Caddy asks which blob to serve for /<name>/ on the pages host; it gets it in X-Blob."""
+    if request.headers.get("x-forwarded-method", "GET") not in ("GET", "HEAD"):
+        return Response(status_code=405)
+    blob = await anyio.to_thread.run_sync(pages.blob_for, request.headers.get("x-forwarded-uri", ""))
+    return Response(headers={"X-Blob": blob}) if blob else PlainTextResponse("no such page\n", status_code=404)
+
+
+async def gallery(_: Request) -> HTMLResponse:
+    return HTMLResponse(await anyio.to_thread.run_sync(pages.gallery))
+
+
 async def put_file(request: Request) -> Response:
     """One file of an upload ticket, streamed to disk and filed before the response."""
     raw = request.scope["raw_path"].decode("latin-1") + "?" + request.scope["query_string"].decode("latin-1")
@@ -62,11 +76,16 @@ async def put_file(request: Request) -> Response:
     except documents.DocumentError as e:
         return PlainTextResponse(f"{e}\n", status_code=413)
     name = documents.safe_name(urllib.parse.unquote(request.path_params["name"]))
-    result = await anyio.to_thread.run_sync(partial(
-        filing.file, part, original_name=name, origin=filing.origin_of(ticket["client"]), added_by=ticket["client"],
-        purpose=ticket["purpose"], tags=ticket["tags"]))
-    return JSONResponse({"note": result["note"], "duplicate": result["duplicate"]},
-                        status_code=200 if result["duplicate"] else 201)
+    try:
+        result = await anyio.to_thread.run_sync(partial(
+            filing.file, part, original_name=name, origin=filing.origin_of(ticket["client"]),
+            added_by=ticket["client"], purpose=ticket["purpose"], tags=ticket["tags"], replaces=ticket.get("replaces")))
+    except documents.DocumentError as e:
+        return PlainTextResponse(f"{e}\n", status_code=409)
+    answer = {"note": result["note"], "duplicate": result["duplicate"]}
+    if view := pages.view_url(result["note"]):
+        answer["view_url"] = view
+    return JSONResponse(answer, status_code=200 if result["duplicate"] else 201)
 
 
 async def healthz(_: Request) -> PlainTextResponse:
@@ -78,6 +97,8 @@ def build() -> FastMCP:
     server = FastMCP("vault", instructions=INSTRUCTIONS, auth=build_auth(), middleware=[Gatekeeper()])
     server.mount(vault)
     server.custom_route("/_verify", methods=["GET", "HEAD"])(verify)
+    server.custom_route("/_page", methods=["GET", "HEAD"])(page)
+    server.custom_route("/_pages", methods=["GET"])(gallery)
     server.custom_route("/u/{ticket}/{name}", methods=["PUT"])(put_file)
     server.custom_route("/healthz", methods=["GET"])(healthz)
     return server

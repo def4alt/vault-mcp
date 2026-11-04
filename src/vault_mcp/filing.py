@@ -4,6 +4,7 @@
     files/<slug>.md             frontmatter (tags, categories, about, related...) + summary + embed
 
 Uploads (signed PUTs), URL fetches, ChatGPT attachments and the drop folder all go through file().
+A new version of a file replaces the blob of its note; the earlier blobs stay, listed in `versions`.
 """
 from __future__ import annotations
 
@@ -56,10 +57,39 @@ def store_blob(src: Path, sha: str, name: str) -> str:
     raise RuntimeError(f"hash collision storing {name}")
 
 
+def _replace(src: Path, sha: str, note: str, original_name: str, added_by: str) -> dict:
+    """src (consumed) as the new version of an existing file note: same note, same page URL."""
+    path = config.VAULT_ROOT / f"{note}.md"
+    with repo.locked():
+        if not path.is_file():
+            src.unlink()
+            raise documents.DocumentError(f"no file note `{note}` to replace")
+        meta, body = split_frontmatter(path.read_text("utf-8"))
+        if meta.get("sha256") == sha:
+            src.unlink()
+            return {"note": note, "blob": None, "duplicate": True}
+        old, size = str(meta.get("blob") or ""), src.stat().st_size
+        blob = store_blob(src, sha, original_name)
+        preview = (documents.text_for(config.VAULT_ROOT / blob, sha) or "")[:800].strip()
+        versions = [b for b in dict.fromkeys([old, *(meta.get("versions") or [])]) if b and b != blob]
+        meta.update(as_of=dt.date.today(), media=documents.media_of(original_name), size=size,
+                    mime=documents.mime_of(original_name), original_name=original_name, blob=blob, sha256=sha,
+                    versions=versions)
+        body = body.replace(f"![[{old}]]", f"![[{blob}]]") if old else body
+        body = re.sub(r"## Preview\n\n.*?(?=\n## |\Z)", lambda _: f"## Preview\n\n{preview}\n", body, flags=re.S)
+        path.write_text(render(meta, body), "utf-8")
+        repo.commit([f"{note}.md"], f"file: new version of {note} ({added_by})", "vault-worker")
+    index.reindex([f"{note}.md"])
+    return {"note": note, "blob": blob, "duplicate": False}
+
+
 def file(src: Path, *, original_name: str, origin: str, added_by: str, purpose: str = "",
-         url: str | None = None, tags: list[str] | None = None) -> dict:
-    """File src (consumed) into the vault. Returns {"note", "blob", "duplicate"}."""
+         url: str | None = None, tags: list[str] | None = None, replaces: str | None = None) -> dict:
+    """File src (consumed) into the vault. Returns {"note", "blob", "duplicate"}.
+    With replaces (a file note, files/<name>), src becomes that note's new version instead."""
     sha = documents.sha256_of(src)
+    if replaces:
+        return _replace(src, sha, replaces, original_name, added_by)
     if existing := note_for_hash(sha):
         src.unlink()
         return {"note": existing, "blob": None, "duplicate": True}

@@ -38,6 +38,7 @@ def index_path() -> Path:
 
 # Public URL of this server: MCP at /mcp, OAuth, file links (/f, /d) and uploads (/u).
 PUBLIC_URL = env("PUBLIC_URL", "http://localhost:8000").rstrip("/")
+PAGES_URL = env("PAGES_URL", "").rstrip("/")  # where a person views HTML file notes (pages.py); empty = off
 NOTES_BASE_URL = env("NOTES_BASE_URL", "http://localhost:3000").rstrip("/")  # SilverBullet: where a person reads a page
 LINK_SECRET = env("LINK_SECRET", "")
 LINK_TTL = int(env("LINK_TTL_SECONDS", "3600"))

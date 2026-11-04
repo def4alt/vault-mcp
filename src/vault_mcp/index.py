@@ -9,7 +9,7 @@ tables are the vault's public data model:
     documents     the documents tree: id (doc:<path>), path, folder, name, media, mime, size, sha256
     links         src -> dst, field (body, embed, or the frontmatter field: source, about, ...)
     tags          id, tag                      (view over facets: tags, categories, kind, ...)
-    files         file notes with name, mime, size, blob and a signed download url (view)
+    files         file notes with name, mime, size, blob, a signed download url and a page url (view)
     fts           full text (title, summary, body) of notes, file contents and documents
     commits       sha, date, author, message;  commit_files: sha, id
     problems      kind, id, detail             (lint findings, refreshed by the worker)
@@ -29,11 +29,11 @@ import time
 from collections.abc import Iterator
 from pathlib import Path
 
-from . import config, documents, repo, signing
+from . import config, documents, pages, repo, signing
 from .lint import Problem
 from .vault import PAGE_DIRS, page_paths, read_page
 
-SCHEMA_VERSION = "2"
+SCHEMA_VERSION = "3"
 LINK_FIELDS = ("source", "about", "related", "supersedes", "projects")
 
 DDL = """
@@ -56,7 +56,8 @@ CREATE VIEW tags AS SELECT id, value AS tag FROM facets WHERE field = 'tags';
 CREATE VIEW files AS
   SELECT id, title, json_extract(fm, '$.original_name') AS name, json_extract(fm, '$.mime') AS mime,
          json_extract(fm, '$.size') AS size, tags, summary, blob, sha256,
-         link(blob, json_extract(fm, '$.original_name')) AS url
+         link(blob, json_extract(fm, '$.original_name')) AS url,
+         CASE WHEN json_extract(fm, '$.mime') = 'text/html' THEN page_url(id) END AS view
   FROM notes WHERE folder = 'files';
 CREATE INDEX notes_uid ON notes(uid);
 CREATE INDEX notes_folder ON notes(folder);
@@ -88,6 +89,7 @@ def _functions(conn: sqlite3.Connection) -> None:
     conn.create_function("regexp", 2, _regexp, deterministic=True)
     conn.create_function("link", 1, _link)
     conn.create_function("link", 2, _link)
+    conn.create_function("page_url", 1, pages.url)
 
 
 @contextlib.contextmanager

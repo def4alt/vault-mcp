@@ -15,7 +15,8 @@ LINK_FIELDS = ("source", "about", "related", "supersedes", "projects")
 PAGE_DIRS = ("notes", "sources", "projects", "files", "handoffs")
 DATE_KEYS = ("as_of", "reviewed", "review")
 FIELD_ORDER = ["id", "kind", "status", "as_of", "reviewed", "to", "from", "categories", "tags", "origin", "source_kind",
-               "blob", "media", "mime", "size", "original_name", "sha256", "url", "source", "about", "related",
+               "blob", "media", "mime", "size", "original_name", "sha256", "versions", "url", "source", "about",
+               "related",
                "supersedes", "projects", "refs", "mentions", "rating", "area", "review", "aliases", "summary"]
 
 

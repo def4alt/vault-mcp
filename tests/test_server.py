@@ -18,6 +18,8 @@ from fastmcp.exceptions import ToolError
 
 from vault_mcp import config, incoming, signing, worker
 from vault_mcp.app.server import build
+from vault_mcp.lint import lint
+from vault_mcp.vault import Vault
 
 SKELETON = Path(__file__).parent / "fixture"
 
@@ -287,6 +289,65 @@ async def test_downloads_are_checked_for_caddy_before_it_serves_them(server, env
     assert check(signing.document_link("University/plan.pdf").replace("University", ".git")) == 403
     with pytest.raises(ValueError):
         signing.document_link(".incoming/x")
+
+
+PAGE = "<!doctype html><title>Q3 &amp; Q4 report</title><body><h1>Revenue {}</h1></body>"
+
+
+def shown(base, path, method="GET"):
+    """What Caddy's pages host would do for path: (status, blob it serves)."""
+    r = httpx2.get(f"{base}/_page", headers={"X-Forwarded-Uri": path, "X-Forwarded-Method": method})
+    return r.status_code, r.headers.get("x-blob")
+
+
+async def test_an_html_file_is_a_page_whose_url_stays_across_new_versions(server, env, tmp_path, monkeypatch):
+    root, _ = env
+    monkeypatch.setattr(config, "PAGES_URL", "https://pages.example")
+    (tmp_path / "report.html").write_text(PAGE.format("went up"))
+    async with hermes(server) as c:
+        first = (await c.call_tool("upload", {"filename": "report.html", "purpose": "Q3 numbers"})).data
+    out = subprocess.run(first.curl, shell=True, cwd=tmp_path, capture_output=True, text=True, check=True).stdout
+    assert '"view_url":"https://pages.example/report/"' in out.replace(" ", "")
+    status, v1 = shown(server, "/report/")
+    assert status == 200 and (root / "blobs" / v1).read_text() == PAGE.format("went up")
+
+    (tmp_path / "report.html").write_text(PAGE.format("went down"))
+    before = commits(root)
+    async with hermes(server) as c:
+        second = (await c.call_tool("upload", {"filename": "report.html", "replaces": "files/report"})).data
+    out = subprocess.run(second.curl, shell=True, cwd=tmp_path, capture_output=True, text=True, check=True).stdout
+    assert '"note":"files/report"' in out.replace(" ", "") and commits(root) == before + 1
+    status, v2 = shown(server, "/report")
+    assert status == 200 and v2 != v1 and (root / "blobs" / v2).read_text() == PAGE.format("went down")
+    note = (await call("fetch", id="files/report"))
+    assert note.url == note.metadata["view_url"] == "https://pages.example/report/"
+    assert note.metadata["versions"] == [f"blobs/{v1}"] and note.metadata["summary"] == "Q3 numbers"
+    assert "went down" in note.text and "went up" not in note.text  # the preview follows the new version
+    assert await rows("SELECT view FROM files") == [{"view": "https://pages.example/report/"}]
+
+    async with hermes(server) as c:  # the same bytes again change nothing
+        again = (await c.call_tool("upload", {"filename": "report.html", "replaces": "files/report"})).data
+    assert httpx2.put(again.put_url.replace("{filename}", "report.html"), content=PAGE.format("went down")).json() \
+        == {"note": "files/report", "duplicate": True, "view_url": "https://pages.example/report/"}
+    with pytest.raises(ToolError, match="versions"):  # earlier versions are kept, not orphans
+        await call("delete", paths=[f"blobs/{v1}"], message="tidy: old version")
+    assert not [p for p in lint(Vault(root)) if p.kind == "blob"]
+
+    gallery = httpx2.get(f"{server}/_pages").text
+    assert 'href="/report/"' in gallery and "Q3 &amp; Q4 report" in gallery and "Q3 numbers" in gallery
+
+
+async def test_only_html_file_notes_are_pages(server, env, tmp_path, monkeypatch):
+    monkeypatch.setattr(config, "PAGES_URL", "https://pages.example")
+    (tmp_path / "plan.pdf").write_bytes(b"%PDF-1.4 plan")
+    async with hermes(server) as c:
+        ticket = (await c.call_tool("upload", {"filename": "plan.pdf"})).data
+        with pytest.raises(ToolError, match="not a file note"):
+            await c.call_tool("upload", {"filename": "x.html", "replaces": "notes/acme"})
+    out = subprocess.run(ticket.curl, shell=True, cwd=tmp_path, capture_output=True, text=True, check=True).stdout
+    assert "view_url" not in out
+    assert shown(server, "/plan/") == (404, None) and shown(server, "/missing/") == (404, None)
+    assert shown(server, "/../files/plan/")[0] == 404 and shown(server, "/plan/", "POST")[0] == 405
 
 
 async def test_urls_and_chatgpt_attachments_are_pulled_by_the_server(env, tmp_path, monkeypatch):

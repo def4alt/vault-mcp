@@ -27,8 +27,8 @@ class Document(BaseModel):
     text: str
     url: str
     metadata: dict[str, Any] = Field(default_factory=dict, description=(
-        "Frontmatter, rev (pass as base_rev to write), backlinks, download_url for files, "
-        "next_offset when the text continues"))
+        "Frontmatter, rev (pass as base_rev to write), backlinks, download_url for files, view_url for "
+        "pages (HTML files), next_offset when the text continues"))
 
 
 class SqlResult(BaseModel):
@@ -69,6 +69,7 @@ class FileRef(BaseModel):
 class UploadResult(BaseModel):
     note: str | None = Field(None, description="The file note created (or found, if the file was already there)")
     duplicate: bool | None = None
+    view_url: str | None = Field(None, description="Stable link to open an HTML file (a page) in a browser")
     put_url: str | None = Field(None, description="HTTP PUT target; replace {filename} (URL-encoded)")
     curl: str | None = Field(None, description="Ready upload command; prints the file note as JSON")
     expires_at: str | None = None
