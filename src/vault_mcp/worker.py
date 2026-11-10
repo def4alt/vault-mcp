@@ -3,7 +3,7 @@
 Each cycle (every WORKER_INTERVAL seconds):
   1. drop folder      files dropped into Agent/inbox (Syncthing, Hermes) -> filing.file()
   2. publish          anything still marked touched is re-derived, exported and committed
-  3. derive           the blob listing every cycle; documents (text extraction, embeddings) every few cycles
+  3. derive           the blob listing and missing embeddings every cycle; documents every few cycles
   4. push             the export to its git mirror every PUSH_INTERVAL
   5. prune            expired upload tickets, abandoned partial files, unused text extracts
 
@@ -71,6 +71,7 @@ def run_once(cycle: int = 0, last_push: float = 0.0) -> float:
         store.sync_blobs(conn)
         store.publish(conn, "export: pages changed outside a write")
     with store.connect() as conn:
+        store.embed_backlog(conn)
         if cycle % SLOW_EVERY == 0:
             store.sync_documents(conn, extract=True)
             kinds = dict(conn.execute("SELECT kind, count(*) FROM problems GROUP BY kind").fetchall())

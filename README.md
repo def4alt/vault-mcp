@@ -45,7 +45,8 @@ unless it says `many`. Lint findings and review queues are views and saved queri
 - **Every change marks what it touched.** Triggers put page ids into `touched`; `drain` re-derives links,
   chunks and embeddings for those pages and re-exports them. The worker drains whatever a crash left behind.
 - **Meaning is a column.** Each paragraph and each fact is a chunk with an embedding (a small local model
-  through fastembed; a hashed bag of words when `EMBED_MODEL` is empty). Search is a query over it.
+  run by onnxruntime, by default Microsoft Harrier OSS v1 0.6B; a hashed bag of words when `EMBED_MODEL` is
+  empty). The worker embeds new or changed text in the background; search is a query over the column.
 
 ## Moving bytes
 
@@ -102,7 +103,7 @@ vault_mcp/
 | Env | Meaning |
 |---|---|
 | `DB_PATH`, `VAULT_ROOT`, `DOCS_ROOT`, `CACHE_ROOT`, `DROP_REL` | The database, its export (git) and blobs, documents, cache, drop folder |
-| `EMBED_MODEL` | fastembed model for embeddings (`BAAI/bge-small-en-v1.5`); empty = hashed bag of words |
+| `EMBED_MODEL`, `EMBED_FILE`, `EMBED_QUERY_PREFIX`, `EMBED_MAX_TOKENS`, `EMBED_THREADS` | Hugging Face repository and file of the ONNX embedding model (Harrier OSS v1 0.6B), the instruction put before queries, limits; empty model = hashed bag of words |
 | `PUBLIC_URL`, `NOTES_BASE_URL`, `LINK_SECRET` | This server's URL (MCP, OAuth, links), SilverBullet for citations, the link key |
 | `PAGES_URL` | The pages host, where a person views HTML file notes (empty = no page URLs) |
 | `GITHUB_CLIENT_ID`, `GITHUB_CLIENT_SECRET`, `JWT_SIGNING_KEY`, `ALLOWED_GITHUB_LOGINS` | OAuth |

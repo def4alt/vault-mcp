@@ -34,7 +34,13 @@ def incoming_root() -> Path:
 
 
 DB_PATH = Path(env("DB_PATH", "/db/vault.db"))  # the vault itself: one SQLite file
-EMBED_MODEL = env("EMBED_MODEL", "BAAI/bge-small-en-v1.5")  # fastembed model; empty = hashed bag of words
+# Embeddings: a Hugging Face repository with an ONNX export, run on the CPU. Empty model = hashed bag of words.
+EMBED_MODEL = env("EMBED_MODEL", "onnx-community/harrier-oss-v1-0.6b-ONNX")  # Microsoft Harrier OSS v1 0.6B
+EMBED_FILE = env("EMBED_FILE", "onnx/model.onnx")  # full precision: the fastest variant on a CPU without VNNI
+EMBED_QUERY_PREFIX = env("EMBED_QUERY_PREFIX", "Instruct: Given a web search query, retrieve relevant passages "
+                                               "that answer the query\nQuery: ")
+EMBED_MAX_TOKENS = int(env("EMBED_MAX_TOKENS", "512"))
+EMBED_THREADS = int(env("EMBED_THREADS", "4"))
 
 
 def db_path() -> Path:

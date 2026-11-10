@@ -250,10 +250,12 @@ def fact_text(f: sqlite3.Row) -> str:
 
 
 def _set_chunks(conn: sqlite3.Connection, page: str, title: str, pieces: list[tuple[str, str]]) -> None:
+    known = dict(conn.execute("SELECT text, embedding FROM chunks WHERE page = ? AND embedding IS NOT NULL", (page,)))
     conn.execute("DELETE FROM fts WHERE rowid IN (SELECT id FROM chunks WHERE page = ?)", (page,))
     conn.execute("DELETE FROM chunks WHERE page = ?", (page,))
-    vectors = embed.passages([f"{title}: {text}" for _, text in pieces])
-    for (ref, text), vector in zip(pieces, vectors, strict=True):
+    for ref, text in pieces:
+        # unchanged text keeps its vector; new text is embedded here by the hashed stand-in, later by the worker
+        vector = known.get(text) or (None if config.EMBED_MODEL else embed.passage(title, text))
         cur = conn.execute("INSERT INTO chunks (ref, page, title, text, embedding) VALUES (?, ?, ?, ?, ?)",
                            (ref, page, title, text, vector))
         conn.execute("INSERT INTO fts (rowid, title, text) VALUES (?, ?, ?)", (cur.lastrowid, title, text))
@@ -354,15 +356,30 @@ def sync_documents(conn: sqlite3.Connection, extract: bool = True) -> int:
 
 
 def check_model(conn: sqlite3.Connection) -> None:
-    """Embeddings from another model are useless: re-derive everything when the model changes."""
+    """Vectors from another model cannot be compared: forget them all when the model changes."""
     row = conn.execute("SELECT value FROM meta WHERE key = 'embed_model'").fetchone()
     if row and row[0] == embed.model_id():
         return
     conn.execute("BEGIN IMMEDIATE")
     conn.execute("INSERT OR REPLACE INTO meta VALUES ('embed_model', ?)", (embed.model_id(),))
-    derive_all(conn)
-    conn.execute("DELETE FROM documents")
+    conn.execute("UPDATE chunks SET embedding = NULL")
     conn.execute("COMMIT")
+
+
+def embed_backlog(conn: sqlite3.Connection, seconds: float = 20.0) -> int:
+    """Give vectors to chunks that have none yet (new or changed text), for about `seconds`; the worker's job.
+    Search works meanwhile: such chunks are found by keyword only."""
+    deadline, done = time.monotonic() + seconds, 0
+    while time.monotonic() < deadline:
+        rows = conn.execute("SELECT id, title, text FROM chunks WHERE embedding IS NULL LIMIT 8").fetchall()
+        if not rows:
+            break
+        vectors = [(embed.passage(r["title"], r["text"]), r["id"]) for r in rows]  # computed outside any lock
+        conn.execute("BEGIN IMMEDIATE")
+        conn.executemany("UPDATE chunks SET embedding = ? WHERE id = ? AND embedding IS NULL", vectors)
+        conn.execute("COMMIT")
+        done += len(rows)
+    return done
 
 
 # --- writing ---------------------------------------------------------------------------

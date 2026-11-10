@@ -3,8 +3,10 @@
     embed('where do I live')            SQL function, the query side
     cosine(a, b)                        SQL function, similarity of two stored vectors
 
-The model is a small local one (config.EMBED_MODEL, run by fastembed on the CPU). With no model
-configured, a hashed bag of words stands in: enough for tests and for a host without the model.
+The model is an ONNX export run on the CPU by onnxruntime (config.EMBED_MODEL, a Hugging Face repository;
+by default Microsoft's Harrier OSS v1 0.6B, multilingual, 1,024 dimensions). Harrier is trained with an
+instruction on the query side and none on the passage side. With no model configured, a hashed bag of
+words stands in: enough for tests and for a host without the model.
 """
 from __future__ import annotations
 
@@ -12,6 +14,7 @@ import functools
 import logging
 import re
 import zlib
+from pathlib import Path
 
 import numpy as np
 
@@ -21,14 +24,29 @@ log = logging.getLogger("vault-embed")
 HASH_DIM = 256
 
 
-@functools.lru_cache(maxsize=2)
-def _model(name: str):
-    from fastembed import TextEmbedding  # imported late: the hash fallback needs none of it
-    return TextEmbedding(name, cache_dir=str(config.CACHE_ROOT / "models"))
+@functools.lru_cache(maxsize=1)
+def _model(repo: str, file: str):
+    """(tokenizer, session, input names, output name) of the ONNX model, downloaded once into the cache."""
+    import onnxruntime as ort  # imported late: the hash fallback needs none of it
+    from huggingface_hub import snapshot_download
+    from tokenizers import Tokenizer
+    root = Path(snapshot_download(  # real files, not cache symlinks: onnxruntime wants the weights beside the graph
+        repo, allow_patterns=[file, f"{file}_data*", "tokenizer.json"],
+        local_dir=str(config.CACHE_ROOT / "models" / repo.replace("/", "--"))))
+    tokenizer = Tokenizer.from_file(str(root / "tokenizer.json"))
+    tokenizer.enable_truncation(max_length=config.EMBED_MAX_TOKENS)
+    tokenizer.no_padding()
+    options = ort.SessionOptions()
+    options.intra_op_num_threads = config.EMBED_THREADS
+    session = ort.InferenceSession(str(root / file), options, providers=["CPUExecutionProvider"])
+    outputs = [o.name for o in session.get_outputs()]
+    output = "sentence_embedding" if "sentence_embedding" in outputs else outputs[0]
+    log.info("embedding model %s/%s loaded (output %s)", repo, file, output)
+    return tokenizer, session, {i.name for i in session.get_inputs()}, output
 
 
 def model_id() -> str:
-    return config.EMBED_MODEL or f"hash-{HASH_DIM}"
+    return f"{config.EMBED_MODEL}/{config.EMBED_FILE}" if config.EMBED_MODEL else f"hash-{HASH_DIM}"
 
 
 def _hashed(text: str) -> np.ndarray:
@@ -39,29 +57,37 @@ def _hashed(text: str) -> np.ndarray:
 
 
 def _unit(v: np.ndarray) -> bytes:
+    v = np.asarray(v, dtype=np.float32)
     norm = float(np.linalg.norm(v))
-    return (v / norm if norm else v).astype(np.float32).tobytes()
+    return (v / norm if norm else v).tobytes()
 
 
-def passages(texts: list[str]) -> list[bytes]:
-    """Vectors for stored text."""
-    if not texts:
-        return []
+def _encode(text: str) -> bytes:
+    """One text at a time: no padding, so the last token is the one the model pools."""
     if not config.EMBED_MODEL:
-        return [_unit(_hashed(t)) for t in texts]
-    return [_unit(np.asarray(v)) for v in _model(config.EMBED_MODEL).passage_embed(texts)]
+        return _unit(_hashed(text))
+    tokenizer, session, inputs, output = _model(config.EMBED_MODEL, config.EMBED_FILE)
+    ids = np.asarray([tokenizer.encode(text).ids], dtype=np.int64)
+    feed = {"input_ids": ids, "attention_mask": np.ones_like(ids)}
+    if "position_ids" in inputs:
+        feed["position_ids"] = np.arange(ids.shape[1], dtype=np.int64)[None, :]
+    out = session.run([output], {k: v for k, v in feed.items() if k in inputs})[0]
+    return _unit(out[0] if out.ndim == 2 else out[0, -1])  # (1, dim) pooled, or (1, tokens, dim): last token
+
+
+def passage(title: str | None, text: str) -> bytes:
+    """The vector of stored text, with the title of its page for context."""
+    return _encode(f"{title}: {text}" if title else text)
 
 
 @functools.lru_cache(maxsize=256)
 def _query(model: str, text: str) -> bytes:
-    if not model:
-        return _unit(_hashed(text))
-    return _unit(np.asarray(next(iter(_model(model).query_embed(text)))))
+    return _encode((config.EMBED_QUERY_PREFIX if model else "") + text)
 
 
 def query(text: str | None) -> bytes | None:
     """The vector of a question (SQL: embed(text))."""
-    return _query(config.EMBED_MODEL, text) if text else None
+    return _query(model_id(), text) if text else None
 
 
 def cosine(a: bytes | None, b: bytes | None) -> float | None:

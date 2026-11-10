@@ -9,6 +9,7 @@
 """
 from __future__ import annotations
 
+import threading
 import urllib.parse
 from functools import partial
 
@@ -18,7 +19,7 @@ from prometheus_client import start_http_server
 from starlette.requests import Request
 from starlette.responses import HTMLResponse, JSONResponse, PlainTextResponse, Response
 
-from .. import config, documents, filing, incoming, pages, signing, store
+from .. import config, documents, embed, filing, incoming, pages, signing, store
 from .auth import Gatekeeper, build_auth
 from .tools import vault
 
@@ -106,6 +107,7 @@ def build() -> FastMCP:
 
 
 def main() -> None:
+    threading.Thread(target=embed.query, args=("warm up",), daemon=True).start()  # load the model before a search
     if config.METRICS_PORT:
         start_http_server(config.METRICS_PORT)  # its own port, never published
     build().run(transport="http", host="0.0.0.0", port=config.PORT, path="/mcp")

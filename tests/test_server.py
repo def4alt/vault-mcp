@@ -374,6 +374,15 @@ async def test_the_worker_files_drops_and_publishes_what_is_left_touched(env):
     assert (await call("search", query="typed by hand")).results[0].id == "notes/typed"
 
 
+async def test_the_worker_embeds_text_that_has_no_vector_yet(env):
+    await write(ACME)
+    with store.connect() as conn:  # as after a model change, or a write while a real model is configured
+        conn.execute("UPDATE chunks SET embedding = NULL")
+    assert (await call("search", query="company Munich")).results[0].id == "notes/acme"  # keywords still find it
+    worker.run_once()
+    assert await rows("SELECT count(*) AS n FROM chunks WHERE embedding IS NULL") == [{"n": 0}]
+
+
 async def test_documents_are_searchable_readable_and_confined(env):
     _, docs = env
     office(docs / "University/lecture.docx",

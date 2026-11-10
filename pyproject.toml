@@ -1,6 +1,6 @@
 [project]
 name = "vault-mcp"
-version = "1.0.0"
+version = "1.1.0"
 description = "MCP server for a personal Markdown knowledge vault"
 readme = "README.md"
 authors = [
@@ -11,7 +11,9 @@ dependencies = [
     "anyio>=4",
     "fastmcp==4.1.0",
     "prometheus-client>=0.21",
-    "fastembed>=0.7",
+    "huggingface-hub>=0.30",
+    "onnxruntime>=1.20",
+    "tokenizers>=0.21",
     "numpy>=2",
 ]
 
