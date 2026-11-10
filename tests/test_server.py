@@ -445,6 +445,9 @@ async def test_facts_are_rows_with_a_validity_period_and_a_recheck_interval(env)
     assert facts[0]["valid_until"] == "2024-06-30" and facts[0]["note"] == "a | b"
     assert await rows("SELECT claim FROM facts WHERE current AND status = 'confirmed'") == [
         {"claim": "I work at Acme."}]
+    hit = (await call("search", query="where do I work now")).results[0]  # a fact is a search hit of its own
+    assert hit.id == "notes/acme#fact-2" and "still true" in hit.text
+    assert (await call("fetch", id=hit.id)).id == "notes/acme"
     # problems are fresh right after the write: the open question, and the confirmed fact past its recheck
     problems = await rows("SELECT kind, detail FROM problems WHERE id = 'notes/acme' "
                           "AND kind IN ('conflict', 'stale') ORDER BY kind")

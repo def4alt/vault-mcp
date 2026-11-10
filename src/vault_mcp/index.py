@@ -35,7 +35,7 @@ from . import config, documents, pages, repo, signing
 from .lint import FACT_PAGES, Problem, lint
 from .vault import PAGE_DIRS, Vault, facts_of, page_paths, read_page
 
-SCHEMA_VERSION = "4"
+SCHEMA_VERSION = "5"
 LINK_FIELDS = ("source", "about", "related", "supersedes", "projects")
 
 DDL = """
@@ -150,6 +150,8 @@ def _delete(conn: sqlite3.Connection, item_id: str) -> None:
     for table, col in (("notes", "id"), ("documents", "id"), ("facets", "id"), ("links", "src"), ("fts", "id"),
                        ("fact_rows", "page")):
         conn.execute(f"DELETE FROM {table} WHERE {col} = ?", (item_id,))
+    prefix = f"{item_id}#fact-"  # each fact row is searchable on its own
+    conn.execute("DELETE FROM fts WHERE substr(id, 1, ?) = ?", (len(prefix), prefix))
 
 
 def _insert(conn: sqlite3.Connection, table: str, row: dict) -> None:
@@ -195,6 +197,11 @@ def index_page(conn: sqlite3.Connection, path: str) -> None:
         conn.executemany("INSERT INTO fact_rows VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)", [
             (path, f.n, f.claim, f.valid_from, f.valid_until or None, f.status, f.reviewed or None, f.recheck,
              f.source or None, f.note or None) for f in facts_of(page.body)])
+        conn.executemany("INSERT INTO fts (id, title, summary, body) VALUES (?, ?, ?, ?)", [
+            (f"{path}#fact-{f.n}", f.claim, page.title,
+             f"{f.claim} {f.note} ({f.status}, from {f.valid_from}" + (f" until {f.valid_until})" if f.valid_until
+                                                                      else ", still true)"))
+            for f in facts_of(page.body)])
 
 
 def _stale(conn, table: str, entries: dict[str, tuple[float, int]]) -> tuple[list[str], list[str]]:

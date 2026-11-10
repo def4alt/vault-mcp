@@ -64,8 +64,9 @@ def _iso(ts: float) -> str:
 def search(query: str, limit: int = 10, cursor: str | None = None) -> SearchResults:
     """Ranked full-text search over notes, sources, projects, file notes (including the text inside the
     files) and documents. Words match as prefixes, "quoted phrases" exactly. Pages with all the words
-    come first; if none has all of them, pages with any are ranked. Then fetch(id). For filters, tags,
-    links, dates or counts use `sql`."""
+    come first; if none has all of them, pages with any are ranked. A hit `notes/x#fact-3` is one row of
+    that page's fact table (the text is the claim with its validity period). Then fetch(id). For filters,
+    tags, links, dates or counts use `sql`."""
     offset = index.decode_cursor(cursor)
     with index.connect() as conn:
         index.sync_vault(conn)  # a stat scan: picks up edits made in Obsidian or SilverBullet
@@ -119,6 +120,7 @@ def fetch(id: str, offset: int = 0) -> Document:
         text = repo.show(commit, rules.normalise_path(path))
         body, more = _page(text, offset)
         return Document(id=item_id, title=path, text=body, url=_url(path), metadata={"commit": commit, **more})
+    item_id = item_id.split("#", 1)[0]  # a fact hit (notes/x#fact-3) reads its page
     f = _vault_file(item_id)
     if f is None:
         with index.connect() as conn:
