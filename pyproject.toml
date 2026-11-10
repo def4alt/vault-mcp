@@ -1,7 +1,7 @@
 [project]
 name = "vault-mcp"
-version = "1.1.2"
-description = "MCP server for a personal Markdown knowledge vault"
+version = "1.2.0"
+description = "MCP server for a SQLite-first personal knowledge vault"
 readme = "README.md"
 authors = [
     { name = "Andrii Olkhovych", email = "andrii.olkhovych@tum.de" }

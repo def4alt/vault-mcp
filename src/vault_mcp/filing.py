@@ -55,11 +55,6 @@ def store_blob(src: Path, sha: str, name: str) -> str:
     raise RuntimeError(f"hash collision storing {name}")
 
 
-def _preview(blob: str, sha: str) -> str:
-    text = (documents.text_for(config.VAULT_ROOT / blob, sha) or "")[:800].strip()
-    return f"\n\n## Preview\n\n{text}" if text else ""
-
-
 def file(src: Path, *, original_name: str, origin: str, added_by: str, purpose: str = "",
          url: str | None = None, tags: list[str] | None = None, replaces: str | None = None) -> dict:
     """File src (consumed) into the vault. Returns {"note", "blob", "duplicate"}.
@@ -77,13 +72,10 @@ def file(src: Path, *, original_name: str, origin: str, added_by: str, purpose: 
                 return {"note": replaces, "blob": None, "duplicate": True}
             blob = store_blob(src, sha, original_name)
             versions = [b for b in dict.fromkeys([old["blob"], *json.loads(old["versions"])]) if b != blob]
-            body = conn.execute("SELECT body FROM pages WHERE id = ?", (replaces,)).fetchone()["body"]
-            body = re.sub(r"\n*## Preview\n\n.*?(?=\n## |\Z)", "", body.replace(f"![[{old['blob']}]]", f"![[{blob}]]"),
-                          flags=re.S).rstrip() + _preview(blob, sha)
             conn.execute("BEGIN IMMEDIATE")
             conn.execute("UPDATE files SET blob = ?, sha256 = ?, mime = ?, size = ?, name = ?, versions = ? "
                          "WHERE id = ?", (blob, sha, mime, size, original_name, json.dumps(versions), replaces))
-            conn.execute("UPDATE pages SET body = ? WHERE id = ?", (body, replaces))
+            conn.execute(f"UPDATE pages SET updated = {store.NOW} WHERE id = ?", (replaces,))
             note, message = replaces, f"file: new version of {replaces} ({added_by})"
         else:
             if existing := conn.execute("SELECT id FROM files WHERE sha256 = ?", (sha,)).fetchone():
@@ -94,9 +86,9 @@ def file(src: Path, *, original_name: str, origin: str, added_by: str, purpose: 
             size_label = f"{size / 1024**2:.1f} MB" if size >= 1024**2 else f"{size / 1024:.0f} KB"
             about = purpose.strip() or f"{original_name} ({documents.media_of(original_name)}, {size_label}), " \
                                        "not described yet."
-            body = (f"{about}\n\n![[{blob}]]\n\nAdded by {added_by} ({origin}) on {today}"
+            body = (f"{about}\n\nAdded by {added_by} ({origin}) on {today}"
                     + (f" from {url}" if url else "") + "."
-                    + (f"\n\nTags: {', '.join(sorted(set(tags)))}" if tags else "") + _preview(blob, sha))
+                    + (f"\n\nTags: {', '.join(sorted(set(tags)))}" if tags else ""))
             base = f"files/{slugify(Path(original_name).stem, 60) or 'file'}"
             note, n = base, 2
             while conn.execute("SELECT 1 FROM pages WHERE id = ?", (note,)).fetchone():

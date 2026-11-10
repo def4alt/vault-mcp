@@ -207,7 +207,9 @@ def connect() -> Iterator[sqlite3.Connection]:
     except sqlite3.OperationalError:
         _create(conn)
     try:
-        _migrate(conn)
+        version = conn.execute("SELECT value FROM meta WHERE key = 'schema'").fetchone()[0]
+        if version != SCHEMA_VERSION:
+            raise RuntimeError(f"unsupported database schema {version}; expected {SCHEMA_VERSION}")
         yield conn
     finally:
         conn.close()
@@ -222,27 +224,6 @@ def _create(conn: sqlite3.Connection) -> None:
             conn.execute("ROLLBACK")
         if "already exists" not in str(e):
             raise
-
-
-def _migrate(conn: sqlite3.Connection) -> None:
-    """Upgrade the canonical database in place, keeping every row and its derived vectors."""
-    if conn.execute("SELECT value FROM meta WHERE key = 'schema'").fetchone()[0] == SCHEMA_VERSION:
-        return
-    conn.execute("BEGIN IMMEDIATE")
-    try:
-        version = conn.execute("SELECT value FROM meta WHERE key = 'schema'").fetchone()[0]
-        if version == "1":
-            conn.execute("DROP VIEW current_facts")
-            conn.execute("CREATE VIEW current_facts AS SELECT * FROM facts WHERE valid_from <= date('now') "
-                         "AND (valid_until IS NULL OR valid_until >= date('now'))")
-            conn.execute("UPDATE meta SET value = ? WHERE key = 'schema'", (SCHEMA_VERSION,))
-            conn.execute("INSERT OR IGNORE INTO touched SELECT subject FROM facts")
-        elif version != SCHEMA_VERSION:
-            raise RuntimeError(f"unsupported database schema {version}; expected {SCHEMA_VERSION}")
-        conn.execute("COMMIT")
-    except Exception:
-        conn.execute("ROLLBACK")
-        raise
 
 
 # --- derived data ------------------------------------------------------------------------
@@ -302,10 +283,6 @@ def derive(conn: sqlite3.Connection, pid: str) -> None:
         return
     pieces = [(pid, t) for t in split(page["body"])] or [(pid, page["title"])]
     pieces += [(f"{pid}#fact-{f['id']}", fact_text(f)) for f in facts]
-    file = conn.execute("SELECT blob, sha256 FROM files WHERE id = ?", (pid,)).fetchone()
-    if file and (config.VAULT_ROOT / file["blob"]).exists():
-        extracted = documents.text_for(config.VAULT_ROOT / file["blob"], file["sha256"])
-        pieces += [(pid, t) for t in split(extracted or "", 40)]
     _set_chunks(conn, pid, page["title"], pieces)
 
 
@@ -357,7 +334,7 @@ def sync_documents(conn: sqlite3.Connection, extract: bool = True) -> int:
     entries: dict[str, tuple[float, int]] = {}
     files: dict[str, Path] = {}
     for p in documents.walk(config.DOCS_ROOT):
-        if drop in p.parents:
+        if drop in p.parents or p.suffix.lower() in documents.HTML:
             continue
         st, item_id = p.stat(), f"doc:{documents.relative(p)}"
         entries[item_id], files[item_id] = (st.st_mtime, st.st_size), p
@@ -528,7 +505,12 @@ def search(conn: sqlite3.Connection, query: str, limit: int, offset: int = 0) ->
     for chunk in sorted(score, key=score.get, reverse=True):
         row = conn.execute("SELECT ref, title, text FROM chunks WHERE id = ?", (chunk,)).fetchone()
         if row and row["ref"] not in best:
-            best[row["ref"]] = {"id": row["ref"], "title": row["title"], "text": row["text"]}
+            owner, marker, number = row["ref"].rpartition("#fact-")
+            fact = conn.execute("SELECT valid_from, valid_until, confirmed, source, note FROM facts "
+                                "WHERE id = ? AND subject = ?", (int(number), owner)).fetchone() \
+                if marker and number.isdecimal() else None
+            best[row["ref"]] = {"id": row["ref"], "title": row["title"], "text": row["text"],
+                                "fact": dict(fact) if fact else None}
     found = list(best.values())
     return found[offset:offset + limit], len(found) > offset + limit
 

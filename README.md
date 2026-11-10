@@ -26,7 +26,7 @@ rebuilds the database from it. Nobody edits it by hand; the next export of a pag
 |---|---|
 | `sql(sql, params)` | One read-only SELECT over every table and view. `embed(text)` and `cosine(a, b)` rank by meaning, `fts` by keywords, `link()` signs download URLs |
 | `write(statements, message)` | INSERT, UPDATE and DELETE on `pages`, `facts`, `questions`, `queries`: one transaction, one `log` row, one git commit of the export. Constraints and triggers do the validation and the bookkeeping |
-| `search(query)` | The common read: keyword and meaning rank fused, over page paragraphs, single facts, file contents and documents; ChatGPT's `{results: [{id, title, text, url}]}` shape |
+| `search(query)` | Keyword and meaning rank fused over pages, facts, attachment descriptions and non-HTML documents; `{results: [{id, title, text, url, fact}]}`. A fact hit carries full dates, confirmation, source and note separately from the clipped preview |
 | `fetch(id)` | A page with its facts, `questions`, `doc:<path>` or `path@commit`; ChatGPT's `{id, title, text, url, metadata}` |
 | `upload(...)` | A URL or a ChatGPT attachment is pulled and filed; otherwise a signed PUT link plus a ready `curl`. `replaces="files/x"` files a new version of that page |
 
@@ -47,6 +47,23 @@ unless it says `many`. Lint findings and review queues are views and saved queri
 - **Meaning is a column.** Each paragraph and each fact is a chunk with an embedding (a small local model
   run by onnxruntime, by default Microsoft Harrier OSS v1 0.6B; a hashed bag of words when `EMBED_MODEL` is
   empty). The worker embeds new or changed text in the background; search is a query over the column.
+- **Blobs are attachments, not knowledge passages.** A file's page describes what it contains and why it
+  matters; its body is never extracted, indexed or appended to `fetch`. Use the explicit download/view URL
+  when the original is needed. HTML documents are also excluded from extraction and indexing. Ordinary
+  non-HTML documents remain content-searchable. No HTML parser, generated previews or blob-content index.
+
+## Evidence retrieval
+
+For complex questions, split the decision into facets and search each independently (in parallel when
+possible). Summaries locate evidence; fetch supporting sources, follow `metadata.next_offset`, inspect
+dates and uncertainty notes, and seek counterevidence before synthesizing. Read unresolved constraints
+from `questions`, not from semantic search. Say "not found" rather than "does not exist"; copied CVs do not
+independently corroborate a claim. Stop when important claims have support and remaining gaps are explicit.
+
+The live vault's `AGENTS` page documents this workflow. Saved SQL recipes `semantic-diverse` (at most two
+distinct references per page), `evidence` (full fact provenance by page or fact ref), `keyword` and
+`open-questions` compose through the existing `sql` tool. They are rows, not new tools or a query planner.
+Default ranking is unchanged. Fact evidence fields are read from `facts`, never inferred from snippets.
 
 ## Moving bytes
 

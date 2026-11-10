@@ -31,7 +31,10 @@ INSTRUCTIONS = (
     "git commit per call. Add files with `upload`; never put file bytes in tool calls.\n\n"
     "You are a trusted collaborator working alongside other agents (Claude, ChatGPT, Hermes) in the same vault. "
     "Start with fetch('notes/current-situation'); conventions are in fetch('AGENTS'), the schema in "
-    "vault://schema. When unsure about a fact, add a row to `questions` instead of guessing."
+    "vault://schema. Stored files are attachments: search and fetch return their descriptions, not blob "
+    "contents. For complex analysis, search each facet, follow sources and pagination, and check dates, "
+    "counterevidence and open questions; recipes are in AGENTS and queries. When unsure about a fact, "
+    "add a row to `questions` instead of guessing."
 )
 STATUS_TEXT = {403: "invalid link\n", 410: "link expired\n"}
 

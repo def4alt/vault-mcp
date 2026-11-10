@@ -78,7 +78,7 @@ def run_once(cycle: int = 0, last_push: float = 0.0) -> float:
             for kind in _reported | set(kinds):
                 PROBLEMS.labels(kind).set(kinds.get(kind, 0))
             _reported.update(kinds)
-            hashes = {r[0] for r in conn.execute("SELECT sha256 FROM files UNION SELECT sha256 FROM documents")}
+            hashes = {r[0] for r in conn.execute("SELECT sha256 FROM documents")}
             documents.prune_text_cache(hashes)
             incoming.prune(now)
             STORED_BYTES.set(incoming.usage())

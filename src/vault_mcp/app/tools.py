@@ -96,15 +96,17 @@ def write(statements: list[Statement], message: str, ctx: Context, idempotency_k
 
 @vault.tool(annotations=_annotations("Search the vault", read_only=True))
 def search(query: str, limit: int = 10, cursor: str | None = None) -> SearchResults:
-    """Search by keywords and by meaning at once, over page paragraphs, single facts, file contents and my
-    documents. A hit is a page (notes/x), one fact (notes/x#fact-12: the claim with its validity period) or
-    a document (doc:<path>). Then fetch(id). For exact filters, dates, counts or your own ranking use `sql`."""
+    """Search keywords and meaning over pages, facts, file DESCRIPTIONS and non-HTML documents. Stored blob
+    bodies and HTML are not indexed or returned. Fact hits include untruncated fact evidence fields.
+    For complex analysis, search each facet, fetch supporting sources and counterevidence, follow pagination,
+    and check dates and open questions. Recipes: fetch('AGENTS'); queries 'semantic-diverse', 'evidence',
+    'keyword', 'open-questions'. For exact filters, dates, counts or your own ranking use `sql`."""
     offset = store.decode_cursor(cursor)
     with store.connect() as conn:
         rows, more = store.search(conn, query, max(1, min(limit, 50)), offset)
     return SearchResults(
         results=[SearchResult(id=r["id"], title=r["title"] or r["id"], text=" ".join(r["text"].split())[:700],
-                              url=_url(r["id"])) for r in rows],
+                              url=_url(r["id"]), fact=r["fact"]) for r in rows],
         next_cursor=store.encode_cursor(offset + len(rows)) if more else None)
 
 
@@ -122,14 +124,17 @@ def _page(text: str, offset: int) -> tuple[str, dict]:
 def fetch(id: str, offset: int = 0) -> Document:
     """Full text of anything search or sql returned: a page with its facts (notes/x, AGENTS, index), the
     question queue (questions), a document (doc:University/x.pdf), or an old version (notes/x@<commit>, the
-    commit from `log.sha`). File pages include the extracted text of their file and a download_url; HTML
-    file pages also a view_url, which is their url. Long texts continue at metadata.next_offset."""
+    commit from `log.sha`). File pages return their description and download_url, never the blob body;
+    HTML file pages also have a view_url. Direct HTML documents return only a link and metadata.
+    Fact refs fetch their parent page. Long texts continue at metadata.next_offset."""
     item_id = id.strip().lstrip("/")
     if item_id.startswith("doc:"):
         p = documents.resolve(item_id.removeprefix("doc:"))
         if not p.is_file():
             raise ToolError(f"no document `{item_id}`; closest: {_closest(item_id)}")
-        text = documents.cached_text(documents.sha256_of(p)) or documents.extract_text(p) or \
+        text = "HTML attachment; open the URL to view it. Its body is not indexed or returned." \
+            if p.suffix.lower() in documents.HTML else \
+            documents.cached_text(documents.sha256_of(p)) or documents.extract_text(p) or \
             f"({documents.media_of(p)} without extractable text; open it with the url)"
         body, more = _page(text, offset)
         return Document(id=item_id, title=p.name, text=body, url=_url(item_id),
@@ -160,8 +165,6 @@ def fetch(id: str, offset: int = 0) -> Document:
         meta["versions"] = json.loads(file["versions"])
         if file["mime"] == "text/html" and (view := pages.url(item_id)):
             meta["view_url"] = view
-        if extracted := documents.text_for(blob, file["sha256"]):
-            text += "\n\n## Extracted text\n\n" + extracted
     body, more = _page(text, offset)
     return Document(id=item_id, title=row["title"], text=body, url=meta.get("view_url") or _url(item_id),
                     metadata={**meta, **more})
@@ -180,7 +183,9 @@ async def upload(ctx: Context, purpose: str = "", tags: list[str] | None = None,
     - a file in your sandbox or on your machine: call with filename only, then run the returned curl
       (or PUT to put_url with {filename} replaced). The response of each PUT names the page. One link
       takes many files for an hour; it needs network access to this server.
-    purpose becomes the first line of the page. Already-stored content is recognised (duplicate).
+    purpose is the searchable description: say what it contains and why it matters. Blob contents are not
+    extracted, indexed or pasted into fetch output. Add important claims as facts/pages, not hidden in files.
+    Already-stored content is recognised (duplicate).
     replaces="files/<name>": the file becomes the new version of that page instead (same page, same
     view_url; the earlier blob is kept in files.versions). An HTML file is a page a person can open: the
     result has its view_url. Conventions for such pages: fetch("AGENTS")."""

@@ -15,7 +15,7 @@ from fastmcp import Client
 from fastmcp.client.transports import StreamableHttpTransport
 from fastmcp.exceptions import ToolError
 
-from vault_mcp import config, incoming, markdown, signing, store, worker
+from vault_mcp import config, documents, filing, incoming, markdown, signing, store, worker
 from vault_mcp.app.server import build
 
 ACME = ("INSERT INTO pages (id, title, body) VALUES (?, ?, ?)", ["notes/acme", "Acme", "A company in Munich."])
@@ -143,14 +143,6 @@ async def test_current_facts_respect_both_ends_of_the_validity_period(env):
                 "('notes/acme', 'Future', date('now', '+1 day'))")
     assert await rows("SELECT claim FROM current_facts ORDER BY id") == [{"claim": "Ongoing"}, {"claim": "Today"}]
     assert await rows("SELECT count(*) AS n FROM facts") == [{"n": 4}]
-    # Rehearse an existing v1 database opening under the new code, not only a fresh schema.
-    with store.connect() as conn:
-        conn.execute("DROP VIEW current_facts")
-        conn.execute("CREATE VIEW current_facts AS SELECT * FROM facts WHERE "
-                     "valid_until IS NULL OR valid_until >= date('now')")
-        conn.execute("UPDATE meta SET value = '1' WHERE key = 'schema'")
-    assert await rows("SELECT claim FROM current_facts ORDER BY id") == [{"claim": "Ongoing"}, {"claim": "Today"}]
-    assert await rows("SELECT count(*) AS n FROM facts") == [{"n": 4}]
 
 
 async def test_renames_and_deletes_follow_through_and_git_keeps_the_past(env):
@@ -179,9 +171,11 @@ async def test_search_ranks_by_keywords_and_meaning_and_a_fact_is_a_hit_of_its_o
     await write(ACME, JOB, ("INSERT INTO pages (id, title, body) VALUES ('notes/alps', 'Alps', "
                             "'Hiking trips in the mountains near Garmisch.')", None))
     top = (await wire("search", query="where do I work"))["results"][0]
-    assert set(top) == {"id", "title", "text", "url"} and top["id"] == "notes/acme#fact-1"
+    assert set(top) == {"id", "title", "text", "url", "fact"} and top["id"] == "notes/acme#fact-1"
     assert "I work at Acme." in top["text"] and "open-ended" in top["text"] and top["title"] == "Acme"
     assert top["url"] == "https://notes.example/notes/acme"
+    assert top["fact"] == {"valid_from": "2026-01-01", "valid_until": None, "confirmed": "2026-01-02",
+                           "source": "[[sources/chat]]", "note": None}
     assert (await call("search", query="mountains hiking")).results[0].id == "notes/alps"
     page = await call("fetch", id=top["id"])
     assert page.id == "notes/acme" and "| 1 | I work at Acme. | 2026-01-01 |" in page.text
@@ -193,6 +187,18 @@ async def test_search_ranks_by_keywords_and_meaning_and_a_fact_is_a_hit_of_its_o
     assert by_words == [{"ref": "notes/alps"}]
     with pytest.raises(ToolError, match="closest: notes/acme"):
         await call("fetch", id="notes/acme-inc")
+
+
+async def test_fact_evidence_survives_clipped_previews_without_hiding_future_or_unconfirmed_claims(env):
+    note = "A deliberately long uncertainty note. " * 60
+    await write(ACME, JOB,
+                ("UPDATE facts SET valid_from = '2099-01-01', confirmed = NULL, note = ? WHERE id = 1", [note]))
+    hits = (await wire("search", query="Acme"))["results"]
+    fact = next(h for h in hits if h["id"] == "notes/acme#fact-1")
+    assert len(fact["text"]) <= 700 and "2099-01-01" not in fact["text"]
+    assert fact["fact"] == {"valid_from": "2099-01-01", "valid_until": None, "confirmed": None,
+                            "source": "[[sources/chat]]", "note": note}
+    assert next(h for h in hits if h["id"] == "notes/acme")["fact"] is None
 
 
 async def test_keyword_search_survives_an_unavailable_embedding_model(env, monkeypatch):
@@ -293,9 +299,11 @@ async def test_an_agent_with_a_shell_uploads_by_running_the_returned_curl(server
     out = subprocess.run(ticket.curl, shell=True, cwd=tmp_path, capture_output=True, text=True, check=True).stdout
     assert '"note":"files/report"' in out.replace(" ", "")
     page = (root / "files/report.md").read_text()
-    assert "(hermes)" in page and "Q3 numbers" in page and "Tags: finance" in page and "revenue went up" in page
+    assert "(hermes)" in page and "Q3 numbers" in page and "Tags: finance" in page
+    assert "revenue went up" not in page and "## Preview" not in page and "![[blobs/" not in page
     assert git(root, "ls-files", "blobs") == "" and "files/report.md" in git(root, "ls-files", "files")
-    assert (await call("search", query="revenue")).results[0].id == "files/report"
+    assert (await call("search", query="Q3 numbers")).results[0].id == "files/report"
+    assert await rows("SELECT rowid FROM fts WHERE fts MATCH 'revenue'") == []
     again = httpx2.put(ticket.put_url.replace("{filename}", "copy.txt"), content=b"revenue went up")
     assert again.status_code == 200 and again.json() == {"note": "files/report", "duplicate": True}
     forged = ticket.put_url.replace("{filename}", "x.txt").replace("s=", "s=A")
@@ -351,7 +359,8 @@ async def test_an_html_file_is_a_page_whose_url_stays_across_new_versions(server
     page = await call("fetch", id="files/report")
     assert page.url == page.metadata["view_url"] == "https://pages.example/report/"
     assert page.metadata["versions"] == [f"blobs/{v1}"] and "Q3 numbers" in page.text
-    assert "went down" in page.text and "went up" not in page.text  # the preview follows the new version
+    assert "went down" not in page.text and "went up" not in page.text  # neither blob body is returned
+    assert "## Preview" not in page.text and "## Extracted text" not in page.text
     assert await rows("SELECT page_url(id) AS view FROM files") == [{"view": "https://pages.example/report/"}]
 
     async with hermes(server) as c:  # the same bytes again change nothing
@@ -400,6 +409,42 @@ async def test_urls_and_chatgpt_attachments_are_pulled_by_the_server(env, tmp_pa
     assert files[0]["mime"] == "application/pdf" and files[0]["url"].startswith("https://vault.example/f/")
 
 
+async def test_stored_blobs_are_description_only_without_any_extraction(env, tmp_path, monkeypatch):
+    def forbidden(*_):
+        raise AssertionError("stored attachments must never be extracted")
+
+    monkeypatch.setattr(documents, "text_for", forbidden)
+    original = b"<!doctype html><style>boilerplateSentinel</style><script>payloadSentinel</script>"
+    source = tmp_path / "viewer.html"
+    source.write_bytes(original)
+    filed = filing.file(source, original_name="viewer.html", origin="manual", added_by="test",
+                        purpose="Interactive customer dataset viewer; inspect the original only when needed.")
+    worker.run_once()
+    page = await call("fetch", id=filed["note"])
+    assert "customer dataset viewer" in page.text and page.metadata["download_url"]
+    assert "payloadSentinel" not in page.text and "boilerplateSentinel" not in page.text
+    assert await rows("SELECT rowid FROM fts WHERE fts MATCH 'payloadSentinel OR boilerplateSentinel'") == []
+    assert (env[0] / filed["blob"]).read_bytes() == original
+
+
+async def test_html_documents_ignore_old_extracts_and_are_not_indexed(env):
+    _, docs = env
+    path = docs / "University/viewer.HTML"
+    original = "<!doctype html><script>hiddenSentinel</script>"
+    path.write_text(original)
+    sha = documents.sha256_of(path)
+    cached = documents._cache(sha)
+    cached.parent.mkdir(parents=True, exist_ok=True)
+    cached.write_text(original)
+    assert documents.text_for(path, sha) is None and documents.extract_text(path) is None
+    worker.run_once()
+    assert await rows("SELECT id FROM documents") == []
+    assert await rows("SELECT ref FROM chunks") == []
+    page = await call("fetch", id="doc:University/viewer.HTML")
+    assert "hiddenSentinel" not in page.text and "not indexed" in page.text
+    assert page.url.startswith("https://vault.example/d/") and path.read_text() == original
+
+
 async def test_an_unused_stored_file_is_removed_by_deleting_its_row(env):
     root, _ = env
     (root / "blobs").mkdir()
@@ -446,6 +491,33 @@ async def test_documents_are_searchable_readable_and_confined(env):
     for item in ("doc:../vault/AGENTS.md", "doc:.stversions/x", ".git/config", "notes/x@HEAD:../.git/config"):
         with pytest.raises(ToolError):
             await call("fetch", id=item)
+
+
+async def test_description_rebuild_removes_blob_and_html_content_without_touching_other_documents(env, tmp_path):
+    root, docs = env
+    source = tmp_path / "data.txt"
+    source.write_text("payloadSentinel")
+    filed = filing.file(source, original_name="data.txt", origin="manual", added_by="test",
+                        purpose="Dataset description with retained context.")
+    (docs / "University/notes.md").write_text("Useful academic evidence, not an attachment.")
+    (docs / "University/viewer.html").write_text("<script>htmlSentinel</script>")
+    worker.run_once()
+    with store.connect() as conn:
+        keep = [tuple(r) for r in conn.execute("SELECT * FROM chunks WHERE page = 'doc:University/notes.md'")]
+        conn.execute("INSERT INTO documents (id, path) VALUES ('doc:University/viewer.html', 'University/viewer.html')")
+        store._set_chunks(conn, filed["note"], "data.txt", [(filed["note"], "payloadSentinel")])
+        store._set_chunks(conn, "doc:University/viewer.html", "viewer.html",
+                          [("doc:University/viewer.html", "htmlSentinel")])
+    with store.connect() as conn:
+        store.derive(conn, filed["note"])
+        store.sync_documents(conn)
+    assert await rows("SELECT rowid FROM fts WHERE fts MATCH 'payloadSentinel OR htmlSentinel'") == []
+    assert await rows("SELECT id FROM documents ORDER BY id") == [{"id": "doc:University/notes.md"}]
+    assert "Dataset description" in (await call("fetch", id=filed["note"])).text
+    assert (root / filed["blob"]).read_text() == "payloadSentinel"
+    with store.connect() as conn:
+        assert [tuple(r) for r in conn.execute("SELECT * FROM chunks WHERE page = 'doc:University/notes.md'")] == keep
+        assert not conn.execute("SELECT 1 FROM touched").fetchone()
 
 
 # --- access ----------------------------------------------------------------------------

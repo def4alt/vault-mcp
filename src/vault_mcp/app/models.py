@@ -9,12 +9,22 @@ from typing import Any
 from pydantic import BaseModel, Field
 
 
+class FactEvidence(BaseModel):
+    valid_from: str
+    valid_until: str | None
+    confirmed: str | None
+    source: str | None
+    note: str | None
+
+
 class SearchResult(BaseModel):
     id: str = Field(description="Pass to fetch(). A page (notes/x), one fact (notes/x#fact-12) or a document "
                                 "(doc:<path>)")
     title: str
     text: str = Field(description="The matching passage, or the fact with its validity period")
     url: str = Field(description="Where a person opens it; cite this")
+    fact: FactEvidence | None = Field(None, description="For a fact hit: full validity, confirmation, source and "
+                                     "uncertainty note, never clipped with the passage preview. Null otherwise.")
 
 
 class SearchResults(BaseModel):

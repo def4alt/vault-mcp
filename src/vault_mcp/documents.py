@@ -17,8 +17,9 @@ VIDEO = {".mp4", ".mov", ".mkv", ".webm", ".avi", ".m4v"}
 AUDIO = {".mp3", ".m4a", ".wav", ".flac", ".ogg", ".opus", ".aac"}
 IMAGE = {".png", ".jpg", ".jpeg", ".gif", ".webp", ".heic", ".svg", ".tif", ".tiff"}
 DATA = {".csv", ".tsv", ".json", ".jsonl", ".xlsx", ".xls", ".ods", ".parquet", ".yaml", ".yml"}
-PLAIN = {".txt", ".md", ".markdown", ".csv", ".tsv", ".json", ".jsonl", ".yaml", ".yml", ".xml", ".html",
-         ".htm", ".tex", ".bib", ".rst", ".org", ".log", ".py", ".js", ".ts", ".go", ".rs", ".java",
+HTML = {".html", ".htm"}  # attachments to open, not knowledge to extract or index
+PLAIN = {".txt", ".md", ".markdown", ".csv", ".tsv", ".json", ".jsonl", ".yaml", ".yml", ".xml",
+         ".tex", ".bib", ".rst", ".org", ".log", ".py", ".js", ".ts", ".go", ".rs", ".java",
          ".kt", ".c", ".h", ".cpp", ".sh", ".sql", ".toml", ".ini", ".srt", ".vtt"}
 OFFICE = {".docx", ".pptx", ".xlsx", ".odt", ".odp", ".ods"}
 EXTRACTABLE = PLAIN | OFFICE | {".pdf"}
@@ -144,10 +145,12 @@ def cached_text(sha: str) -> str | None:
 
 def text_for(path: Path, sha: str) -> str | None:
     """Extracted text of a file, cached by content hash (an empty cache file means "no text")."""
+    if path.suffix.lower() not in EXTRACTABLE:
+        return None  # attachments never have extractable knowledge
     p = _cache(sha)
     if p.exists():
         return p.read_text("utf-8", "replace") or None
-    text = extract_text(path) if path.suffix.lower() in EXTRACTABLE else None
+    text = extract_text(path)
     p.parent.mkdir(parents=True, exist_ok=True)
     tmp = p.with_name(f".{p.name}.tmp")
     tmp.write_text(text or "", "utf-8")
