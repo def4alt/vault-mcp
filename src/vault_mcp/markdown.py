@@ -76,10 +76,13 @@ def parse(text: str) -> dict:
     """The inverse of render: {"private", "file", "title", "body", "facts"}."""
     meta: dict = {}
     if text.startswith("---\n") and (end := text.find("\n---\n", 4)) != -1:
-        for line in text[4:end].splitlines():
-            key, _, value = line.partition(": ")
-            meta[key] = json.loads(value)
-        text = text[end + 5:]
+        try:
+            for line in text[4:end].splitlines():
+                key, _, value = line.partition(": ")
+                meta[key] = json.loads(value)
+            text = text[end + 5:]
+        except ValueError:  # a body that happens to open with a rule, not our header
+            meta = {}
     title = (re.search(r"^# (.+)$", text, re.M) or [None, ""])[1].strip()
     body = re.sub(r"^# .+\n?", "", text, count=1, flags=re.M)
     facts: list[list] = []

@@ -272,6 +272,9 @@ def derive(conn: sqlite3.Connection, pid: str) -> None:
     text = "\n".join([page["body"], *(f"{f['source'] or ''} {f['note'] or ''}" for f in facts)])
     targets = {t for t in markdown.link_targets(text) if t != pid}
     conn.executemany("INSERT INTO links VALUES (?, ?)", [(pid, t) for t in sorted(targets)])
+    if "/" not in pid:  # AGENTS and index are instructions and navigation, not knowledge to search
+        _set_chunks(conn, pid, "", [])
+        return
     pieces = [(pid, t) for t in split(page["body"])] or [(pid, page["title"])]
     pieces += [(f"{pid}#fact-{f['id']}", fact_text(f)) for f in facts]
     file = conn.execute("SELECT blob, sha256 FROM files WHERE id = ?", (pid,)).fetchone()
@@ -460,11 +463,17 @@ def decode_cursor(cursor: str | None) -> int:
         raise ValueError("invalid cursor; start again without one") from None
 
 
+STOPWORDS = set("a an and are as at be by did do does for from had has have how i in is it me my of on or our that the "
+                "their this to was we were what when where which who whom whose why will with you your".split())
+
+
 def fts_query(text: str) -> str:
-    """Any of the words (as prefixes) or "quoted phrases"; BM25 ranks rows with more of them first."""
+    """Any of the words (as prefixes) or "quoted phrases"; BM25 ranks rows with more of them first.
+    Question words and other fillers are left out when anything else remains: meaning ranks those."""
     phrases = [p.replace('"', "") for p in re.findall(r'"([^"]+)"', text)]
     words = re.findall(r"\w+", re.sub(r'"[^"]*"', " ", text))
-    return " OR ".join([f'"{p}"' for p in phrases] + [f'"{w}"*' for w in words])
+    content = [w for w in words if w.lower() not in STOPWORDS]
+    return " OR ".join([f'"{p}"' for p in phrases] + [f'"{w}"*' for w in (content or words)])
 
 
 def search(conn: sqlite3.Connection, query: str, limit: int, offset: int = 0) -> tuple[list[dict], bool]:
