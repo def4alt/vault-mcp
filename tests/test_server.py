@@ -418,3 +418,47 @@ def test_only_known_api_keys_get_in(server):
     assert post().status_code == 401 and post("wrong").status_code == 401
     ok = post("hermes-key")
     assert ok.status_code == 200 and '"serverInfo"' in ok.text
+
+
+# --- fact tables ---------------------------------------------------------------------------
+
+FACTS = """---
+kind: entity
+summary: Acme, a company.
+---
+# Acme
+
+## Facts
+
+| Fact | From | Until | Status | Reviewed | Recheck | Source | Note |
+|---|---|---|---|---|---|---|---|
+| I worked at Acme as an intern. | 2024-01-01 | 2024-06-30 | confirmed | 2024-07-01 | never | [[notes/acme]] | a \\| b |
+| I work at Acme. | 2025-01-01 |  | confirmed | 2025-01-02 | 90d |  |  |
+| Acme moves to Berlin. | 2026-01-01 |  | needs-update |  | 180d |  | Did it? |
+"""
+
+
+async def test_facts_are_rows_with_a_validity_period_and_a_recheck_interval(env):
+    await write("notes/acme", FACTS)
+    facts = await rows("SELECT n, claim, valid_until, status, note, current FROM facts ORDER BY n")
+    assert [f["current"] for f in facts] == [0, 1, 1]
+    assert facts[0]["valid_until"] == "2024-06-30" and facts[0]["note"] == "a | b"
+    assert await rows("SELECT claim FROM facts WHERE current AND status = 'confirmed'") == [
+        {"claim": "I work at Acme."}]
+    # problems are fresh right after the write: the open question, and the confirmed fact past its recheck
+    problems = await rows("SELECT kind, detail FROM problems WHERE id = 'notes/acme' "
+                          "AND kind IN ('conflict', 'stale') ORDER BY kind")
+    assert [p["kind"] for p in problems] == ["conflict", "stale"]
+    assert "Did it?" in problems[0]["detail"] and "I work at Acme." in problems[1]["detail"]
+    await write("notes/acme", FACTS.replace("| needs-update |  |", "| confirmed | 2026-11-01 |").replace(
+        "| 2025-01-02 | 90d |", "| 2025-01-02 | never |"))
+    assert await rows("SELECT kind FROM problems WHERE id = 'notes/acme' AND kind IN ('conflict', 'stale')") == []
+
+
+async def test_a_malformed_fact_row_is_refused(env):
+    for broken, reason in ((FACTS.replace("| 2025-01-01 |", "| last year |"), "From must be"),
+                           (FACTS.replace("| needs-update |", "| maybe |"), "Status"),
+                           (FACTS.replace("| 2025-01-02 | 90d |", "|  | 90d |"), "needs the date"),
+                           (FACTS.replace("a \\| b", "a | b"), "cells")):
+        with pytest.raises(ToolError, match=reason):
+            await write("notes/acme", broken)

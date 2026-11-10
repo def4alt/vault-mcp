@@ -159,9 +159,11 @@ def sql(sql: str, params: list[Any] | None = None, limit: int = 100, cursor: str
     facets(id, field, value); files(id, name, mime, size, tags, summary, blob, url=download link,
     view=page URL of an HTML file);
     fts(id, title, summary, body): FTS5 incl. text inside files; commits(sha, date, author, message);
-    commit_files(sha, id); problems(kind, id, detail). link(blob_or_doc_id) signs a download URL.
+    commit_files(sha, id); problems(kind, id, detail); facts(page, n, claim, valid_from, valid_until, status,
+    reviewed, recheck, source, note, current): the rows of every page's `## Facts` table.
+    link(blob_or_doc_id) signs a download URL.
     E.g. SELECT src FROM links WHERE dst = 'notes/acme' | SELECT id FROM tags WHERE tag = 'slides' |
-    SELECT id FROM notes WHERE kind = 'fact' AND status = 'unreviewed' | SELECT id, snippet(fts, 3, '[',
+    SELECT page, claim FROM facts WHERE current AND status = 'unreviewed' | SELECT id, snippet(fts, 3, '[',
     ']', '…', 12) FROM fts WHERE fts MATCH 'transformer' ORDER BY bm25(fts). Long cells are clipped."""
     with index.connect() as conn:
         index.sync_vault(conn)

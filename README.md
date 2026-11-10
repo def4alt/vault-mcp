@@ -23,14 +23,14 @@ cache/                     derived, rebuildable: index.sqlite + text/<sha256>.tx
 |---|---|
 | `search(query)` | Ranked full text over pages, file contents and documents; ChatGPT's `{results: [{id, title, text, url}]}` shape |
 | `fetch(id)` | A page, `doc:<path>`, a stable uid or `path@commit`; ChatGPT's `{id, title, text, url, metadata}`; `metadata.rev` for writes, `download_url` for files |
-| `sql(sql, params)` | Read-only SQLite over `notes`, `documents`, `links`, `tags`, `files`, `fts`, `commits`, `commit_files`, `problems`; `link()` signs download URLs |
+| `sql(sql, params)` | Read-only SQLite over `notes`, `documents`, `links`, `tags`, `files`, `fts`, `commits`, `commit_files`, `problems`, `facts`; `link()` signs download URLs |
 | `write(changes, message)` | Create, replace, frontmatter-patch or move pages as one commit; `base_rev` per change, `idempotency_key` per call |
 | `delete(paths, message)` | Pages (history keeps them) and blobs no note refers to; the only destructive tool |
 | `upload(...)` | A URL or a ChatGPT attachment is pulled and filed; otherwise a signed PUT link plus a ready `curl`. `replaces="files/x"` files a new version of that note |
 
 `sql` runs on a separate `mode=ro` connection with `query_only`, an authorizer (SELECT/WITH and a few
 read-only pragmas), a time limit, row paging and clipped cells. Lint findings and review queues are just
-queries (`problems`, `notes WHERE status = 'unreviewed'`). Resources: `vault://AGENTS`, `vault://schema`.
+queries (`problems`, `facts WHERE status = 'unreviewed'`). Resources: `vault://AGENTS`, `vault://schema`.
 
 ## Moving bytes
 

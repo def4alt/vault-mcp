@@ -12,7 +12,9 @@ tables are the vault's public data model:
     files         file notes with name, mime, size, blob, a signed download url and a page url (view)
     fts           full text (title, summary, body) of notes, file contents and documents
     commits       sha, date, author, message;  commit_files: sha, id
-    problems      kind, id, detail             (lint findings, refreshed by the worker)
+    facts         one row per claim of a page's `## Facts` table: page, n, claim, valid_from, valid_until,
+                  status, reviewed, recheck, source, note, current (1 while valid_until is empty or ahead)
+    problems      kind, id, detail             (lint findings, refreshed after every write and by the worker)
 
 Incremental sync compares (mtime, size) with what is indexed, so a pass over an unchanged
 vault only stats files. WAL lets the MCP server and the worker share it.
@@ -30,10 +32,10 @@ from collections.abc import Iterator
 from pathlib import Path
 
 from . import config, documents, pages, repo, signing
-from .lint import Problem
-from .vault import PAGE_DIRS, page_paths, read_page
+from .lint import FACT_PAGES, Problem, lint
+from .vault import PAGE_DIRS, Vault, facts_of, page_paths, read_page
 
-SCHEMA_VERSION = "3"
+SCHEMA_VERSION = "4"
 LINK_FIELDS = ("source", "about", "related", "supersedes", "projects")
 
 DDL = """
@@ -51,6 +53,14 @@ CREATE TABLE facets(id TEXT NOT NULL, field TEXT NOT NULL, value TEXT NOT NULL);
 CREATE TABLE commits(sha TEXT PRIMARY KEY, date TEXT, author TEXT, message TEXT);
 CREATE TABLE commit_files(sha TEXT NOT NULL, id TEXT NOT NULL);
 CREATE TABLE problems(kind TEXT NOT NULL, id TEXT NOT NULL, detail TEXT);
+CREATE TABLE fact_rows(
+  page TEXT NOT NULL, n INTEGER NOT NULL, claim TEXT, valid_from TEXT, valid_until TEXT, status TEXT,
+  reviewed TEXT, recheck TEXT, source TEXT, note TEXT
+);
+CREATE VIEW facts AS
+  SELECT page, n, claim, valid_from, valid_until, status, reviewed, recheck, source, note,
+         (valid_until IS NULL OR valid_until >= date('now')) AS current
+  FROM fact_rows;
 CREATE VIRTUAL TABLE fts USING fts5(id UNINDEXED, title, summary, body, tokenize='unicode61 remove_diacritics 2');
 CREATE VIEW tags AS SELECT id, value AS tag FROM facets WHERE field = 'tags';
 CREATE VIEW files AS
@@ -66,6 +76,7 @@ CREATE INDEX facets_id ON facets(id);
 CREATE INDEX links_dst ON links(dst);
 CREATE INDEX links_src ON links(src);
 CREATE INDEX commit_files_id ON commit_files(id);
+CREATE INDEX fact_rows_page ON fact_rows(page);
 """
 
 
@@ -136,7 +147,8 @@ def _create(conn: sqlite3.Connection) -> None:
 # --- keeping it current ---------------------------------------------------------------
 
 def _delete(conn: sqlite3.Connection, item_id: str) -> None:
-    for table, col in (("notes", "id"), ("documents", "id"), ("facets", "id"), ("links", "src"), ("fts", "id")):
+    for table, col in (("notes", "id"), ("documents", "id"), ("facets", "id"), ("links", "src"), ("fts", "id"),
+                       ("fact_rows", "page")):
         conn.execute(f"DELETE FROM {table} WHERE {col} = ?", (item_id,))
 
 
@@ -179,6 +191,10 @@ def index_page(conn: sqlite3.Connection, path: str) -> None:
     links += [("body", t) for t in sorted(page.links - {t for _, t in links})]
     links += [("embed", t) for t in sorted(page.embeds)]
     conn.executemany("INSERT INTO links VALUES (?, ?, ?)", [(path, t, field) for field, t in links])
+    if path.split("/")[0] in FACT_PAGES:
+        conn.executemany("INSERT INTO fact_rows VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)", [
+            (path, f.n, f.claim, f.valid_from, f.valid_until or None, f.status, f.reviewed or None, f.recheck,
+             f.source or None, f.note or None) for f in facts_of(page.body)])
 
 
 def _stale(conn, table: str, entries: dict[str, tuple[float, int]]) -> tuple[list[str], list[str]]:
@@ -275,6 +291,7 @@ def reindex(paths: list[str]) -> None:
                 index_page(conn, path)
             conn.execute("COMMIT")
         sync_commits(conn)
+        set_problems(conn, lint(Vault(config.VAULT_ROOT)))  # so an agent sees what its own write fixed or broke
 
 
 def known_hashes(conn: sqlite3.Connection) -> set[str]:

@@ -9,18 +9,15 @@ from __future__ import annotations
 import argparse
 import datetime as dt
 import re
-from collections import Counter
 from pathlib import Path
 from typing import NamedTuple
 
 import yaml
 
-from .vault import Page, Vault, as_date
+from .vault import FACT_COLUMNS, FACT_STATUSES, Page, Vault, as_date, fact_table, facts_of, recheck_days
 
-STALE_DAYS = 90
-# Capitalised words that are sentence furniture, not names.
-STOPWORDS = {"I", "My", "The", "A", "An", "In", "At", "On", "For", "And", "Or", "Of", "To", "As", "Is", "It",
-             "From", "With", "Not"}
+STALE_DAYS = 90  # fact notes (legacy); fact rows carry their own Recheck interval
+FACT_PAGES = ("notes", "projects")
 
 
 def slug(text: str) -> str:
@@ -58,6 +55,9 @@ def schema_errors(page: Page, schema: dict) -> list[str]:
             if not isinstance(value, list):
                 errors.append(f"`{key}` must be a list")
                 continue
+            if rule.get("items") == "tag" and schema.get("tags"):
+                errors += [f"unknown tag `{t}` (add it to `tags` in .schema/notes.yaml first)"
+                           for t in value if str(t) not in schema["tags"]]
             if rule.get("items") == "category":
                 errors += [f"unknown category `{c}`" for c in value if c not in schema["categories"]]
             if rule.get("items") == "link":
@@ -68,11 +68,44 @@ def schema_errors(page: Page, schema: dict) -> list[str]:
                         errors.append(f"`{key}` item `{v}` must point into {rule['prefix']}")
     if section == "notes" and page.kind == "fact":
         errors += [f"fact missing `{k}`" for k in ("status", "as_of") if not page.meta.get(k)]
+    if section in FACT_PAGES:
+        errors += fact_errors(page.body)
+    return errors
+
+
+def fact_errors(body: str) -> list[str]:
+    """What is wrong with a page's `## Facts` table, row by row."""
+    header, rows = fact_table(body)
+    if header is None:
+        return []
+    if header != FACT_COLUMNS:
+        return ["`## Facts` table must have the columns " + " | ".join(FACT_COLUMNS)]
+    errors = []
+    for n, row in enumerate(rows, 1):
+        if len(row) != len(FACT_COLUMNS):
+            errors.append(f"fact row {n} has {len(row)} cells, not {len(FACT_COLUMNS)} (escape `|` as `\\|`)")
+            continue
+        claim, start, until, status, reviewed, recheck, _source, _note = row
+        if not claim:
+            errors.append(f"fact row {n} has no claim")
+        if as_date(start) is None:
+            errors.append(f"fact row {n}: From must be a YYYY-MM-DD date")
+        for name, value in (("Until", until), ("Reviewed", reviewed)):
+            if value and as_date(value) is None:
+                errors.append(f"fact row {n}: {name} must be empty or a YYYY-MM-DD date")
+        if until and as_date(until) and as_date(start) and as_date(until) < as_date(start):
+            errors.append(f"fact row {n}: Until is before From")
+        if status not in FACT_STATUSES:
+            errors.append(f"fact row {n}: Status `{status}` not in {list(FACT_STATUSES)}")
+        if status == "confirmed" and not reviewed:
+            errors.append(f"fact row {n}: a confirmed fact needs the date I confirmed it under Reviewed")
+        if recheck != "never" and recheck_days(recheck) is None:
+            errors.append(f"fact row {n}: Recheck must be `never` or like `90d` / `1y`")
     return errors
 
 
 class Problem(NamedTuple):
-    # broken-link, conflict, superseded, stale, orphan, undistilled, missing-entity, schema, blob, sync-conflict
+    # broken-link, conflict, superseded, stale, orphan, undistilled, schema, blob, sync-conflict
     kind: str
     id: str  # the page (or blob, or entity name) the problem is about
     detail: str
@@ -84,13 +117,6 @@ def lint(vault: Vault, today: dt.date | None = None) -> list[Problem]:
     notes = [p for p in vault.pages.values() if p.path.startswith("notes/")]
     superseded = vault.superseded_by()
     backlinked = {t for p in vault.pages.values() for t in p.links if t != p.path}
-    entity_names = set()
-    for p in notes:
-        if p.kind == "entity":
-            words = re.findall(r"[A-Za-z0-9]+", p.title)
-            aliases = p.meta.get("aliases") or []
-            entity_names |= {p.path.split("/")[1], slug(p.title), slug("".join(w[0] for w in words))}
-            entity_names |= {slug(str(a)) for a in aliases}
     out: list[Problem] = []
 
     for p in vault.pages.values():
@@ -115,6 +141,18 @@ def lint(vault: Vault, today: dt.date | None = None) -> list[Problem]:
             out.append(Problem("orphan", p.path, "nothing links here and it links to nothing via about/related"))
 
     for p in vault.pages.values():
+        if p.path.split("/")[0] not in FACT_PAGES:
+            continue
+        for f in facts_of(p.body):
+            if f.status == "needs-update":
+                out.append(Problem("conflict", p.path, f"{f.claim} {f.note}".strip()))
+            days = recheck_days(f.recheck)
+            if f.status == "confirmed" and not f.valid_until and days is not None:
+                checked = as_date(f.reviewed) or as_date(f.valid_from)
+                if checked and (today - checked).days > days:
+                    out.append(Problem("stale", p.path, f"{f.claim} (confirmed {checked}, recheck every {f.recheck})"))
+
+    for p in vault.pages.values():
         if p.path.startswith(("sources/", "files/")) and p.path not in backlinked:
             out.append(Problem("undistilled", p.path, "no note cites it yet"))
 
@@ -135,13 +173,6 @@ def lint(vault: Vault, today: dt.date | None = None) -> list[Problem]:
             rel = str(f.relative_to(vault.root))
             out.append(Problem("sync-conflict", rel, "Syncthing conflict copy: merge it into the original, delete it"))
 
-    names: Counter[str] = Counter()
-    for p in notes:
-        if p.kind == "fact":
-            names.update({w for w in re.findall(r"\b[A-Z][\w-]+(?: [A-Z][\w-]+)*", p.title) if w not in STOPWORDS})
-    for name, n in names.most_common():
-        if n >= 3 and slug(name) not in entity_names:
-            out.append(Problem("missing-entity", name, f"named in {n} facts but has no entity note"))
     return out
 
 

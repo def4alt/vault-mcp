@@ -10,14 +10,15 @@ from pathlib import Path
 
 import yaml
 
-WIKILINK = re.compile(r"(!?)\[\[([^\]|#]+)(?:#[^\]|]*)?(?:\|[^\]]*)?\]\]")
+WIKILINK = re.compile(r"(!?)\[\[([^\]|#\\]+)(?:#[^\]|\\]*)?(?:\\?\|[^\]]*)?\]\]")  # \| inside table cells
 LINK_FIELDS = ("source", "about", "related", "supersedes", "projects")
 PAGE_DIRS = ("notes", "sources", "projects", "files", "handoffs")
 DATE_KEYS = ("as_of", "reviewed", "review")
 FIELD_ORDER = ["id", "kind", "status", "as_of", "reviewed", "to", "from", "categories", "tags", "origin", "source_kind",
                "blob", "media", "mime", "size", "original_name", "sha256", "versions", "url", "source", "about",
                "related",
-               "supersedes", "projects", "refs", "mentions", "rating", "area", "review", "aliases", "summary"]
+               "supersedes", "projects", "refs", "mentions", "rating", "area", "review", "aliases", "entity_type",
+               "trust", "sensitivity", "summary"]
 
 
 @dataclass
@@ -75,6 +76,52 @@ def render(meta: dict, body: str) -> str:
     ordered.update({k: v for k, v in meta.items() if k not in ordered and v not in (None, "", [])})
     fm = yaml.safe_dump(ordered, sort_keys=False, allow_unicode=True, width=1000)
     return f"---\n{fm}---\n{body.rstrip()}\n"
+
+
+FACT_COLUMNS = ["Fact", "From", "Until", "Status", "Reviewed", "Recheck", "Source", "Note"]
+FACT_STATUSES = ("unreviewed", "confirmed", "needs-update")
+
+
+@dataclass
+class Fact:
+    """One row of a page's `## Facts` table: a claim with its validity period and review state."""
+    n: int
+    claim: str
+    valid_from: str
+    valid_until: str
+    status: str
+    reviewed: str
+    recheck: str
+    source: str
+    note: str
+
+
+def _cells(line: str) -> list[str]:
+    line = line.strip().removeprefix("|").removesuffix("|")
+    return [c.strip().replace("\\|", "|") for c in re.split(r"(?<!\\)\|", line)]
+
+
+def fact_table(body: str) -> tuple[list[str] | None, list[list[str]]]:
+    """(header cells, rows) of the table under `## Facts`; (None, []) when the page has none."""
+    m = re.search(r"^## Facts[ \t]*\n(.*?)(?=^## |\Z)", body, re.M | re.S)
+    lines = [ln for ln in (m.group(1).splitlines() if m else []) if ln.strip().startswith("|")]
+    if len(lines) < 2:
+        return None, []
+    return _cells(lines[0]), [_cells(ln) for ln in lines[2:]]
+
+
+def facts_of(body: str) -> list[Fact]:
+    """The well-formed fact rows of a page (malformed rows are reported by lint, not returned)."""
+    header, rows = fact_table(body)
+    if header != FACT_COLUMNS:
+        return []
+    return [Fact(i, *row) for i, row in enumerate(rows, 1) if len(row) == len(FACT_COLUMNS)]
+
+
+def recheck_days(text: str) -> int | None:
+    """`90d` -> 90, `1y` -> 365, `never` (or anything else) -> None."""
+    m = re.fullmatch(r"(\d+)([dy])", text.strip())
+    return int(m.group(1)) * (365 if m.group(2) == "y" else 1) if m else None
 
 
 def as_date(value) -> dt.date | None:
