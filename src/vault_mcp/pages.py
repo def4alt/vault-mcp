@@ -1,10 +1,10 @@
-"""Pages: HTML file notes, viewable at a stable URL on their own host.
+"""Pages: HTML files, viewable at a stable URL on their own host.
 
     <PAGES_URL>/<name>/   the current version of files/<name>; Caddy asks /_page which blob to serve
     <PAGES_URL>/          every page, newest first (/_pages)
 
 The bytes stay an ordinary blob. upload(replaces="files/<name>") files a new version under the same
-note, so the URL stays and the note's `versions` keep the earlier blobs. Caddy serves pages on the
+page, so the URL stays and `files.versions` keeps the earlier blobs. Caddy serves pages on the
 tailnet only, with a CSP sandbox: each page gets an opaque origin, without cookies or storage.
 """
 from __future__ import annotations
@@ -15,30 +15,26 @@ import urllib.parse
 
 from . import config
 from .signing import BLOB
-from .vault import split_frontmatter
 
 NAME = re.compile(r"[a-z0-9][a-z0-9-]{0,79}")
 TITLE = re.compile(rb"<title[^>]*>(.*?)</title>", re.I | re.S)
 
 
-def is_page(meta: dict) -> bool:
-    return meta.get("mime") == "text/html" and bool(meta.get("blob"))
-
-
 def url(note: str) -> str | None:
     """Where a person views files/<name>, or None when pages are off."""
-    return f"{config.PAGES_URL}/{note.removeprefix('files/')}/" if config.PAGES_URL else None
+    return f"{config.PAGES_URL}/{note.removeprefix('files/')}/" if config.PAGES_URL and note else None
+
+
+def _html_files() -> list:
+    from . import store
+    with store.connect() as conn:
+        return conn.execute("SELECT f.id, f.blob, p.body, p.updated FROM files f JOIN pages p USING (id) "
+                            "WHERE f.mime = 'text/html' ORDER BY p.updated DESC, f.id").fetchall()
 
 
 def view_url(note: str) -> str | None:
-    """The page URL of a file note, or None if it is not an HTML page or pages are off."""
-    meta = _meta(note.removeprefix("files/"))
-    return url(note) if meta and is_page(meta) else None
-
-
-def _meta(name: str) -> dict | None:
-    f = config.VAULT_ROOT / "files" / f"{name}.md"
-    return split_frontmatter(f.read_text("utf-8", "replace"))[0] if f.is_file() else None
+    """The page URL of a file page, or None if it is not an HTML page or pages are off."""
+    return url(note) if any(r["id"] == note for r in _html_files()) else None
 
 
 def blob_for(request_path: str) -> str | None:
@@ -46,10 +42,10 @@ def blob_for(request_path: str) -> str | None:
     parts = urllib.parse.unquote(urllib.parse.urlsplit(request_path).path).strip("/").split("/")
     if len(parts) != 1 or not NAME.fullmatch(parts[0]):
         return None
-    meta = _meta(parts[0])
-    if meta is None or not is_page(meta):
+    row = next((r for r in _html_files() if r["id"] == f"files/{parts[0]}"), None)
+    if row is None:
         return None
-    blob = str(meta["blob"]).removeprefix("blobs/")
+    blob = row["blob"].removeprefix("blobs/")
     return blob if BLOB.fullmatch(blob) and (config.blobs_root() / blob).is_file() else None
 
 
@@ -60,15 +56,15 @@ def _title(blob: str) -> str | None:
 
 
 def listing() -> list[dict]:
-    """Every page: name, title, summary, as_of; newest first."""
+    """Every page: name, title, summary (the first line of its description), date; newest first."""
     out = []
-    for f in sorted((config.VAULT_ROOT / "files").glob("*.md")):
-        if (blob := blob_for(f"/{f.stem}/")) is None:
+    for r in _html_files():
+        name = r["id"].removeprefix("files/")
+        if (blob := blob_for(f"/{name}/")) is None:
             continue
-        meta = _meta(f.stem) or {}
-        out.append({"name": f.stem, "title": _title(blob) or f.stem, "summary": str(meta.get("summary") or ""),
-                    "as_of": str(meta.get("as_of") or "")})
-    return sorted(out, key=lambda p: (p["as_of"], p["name"]), reverse=True)
+        out.append({"name": name, "title": _title(blob) or name, "summary": r["body"].strip().split("\n", 1)[0],
+                    "as_of": r["updated"][:10]})
+    return out
 
 
 def gallery() -> str:

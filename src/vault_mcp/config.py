@@ -15,8 +15,9 @@ def _pairs(text: str) -> dict[str, str]:
     return dict(item.split("=", 1) for item in filter(None, text.replace("\n", ",").split(",")) if "=" in item)
 
 
-# Storage. The vault (git) holds notes and file notes; blobs/ holds the files themselves
-# (content-addressed, not in git). Documents are read-only. The cache is derived and rebuildable.
+# Storage. The database is the vault. VAULT_ROOT is its Markdown export (a git repo, written after every
+# change) plus blobs/, the stored files (content-addressed, not in git). Documents are read-only. The cache
+# holds text extracts and the embedding model.
 VAULT_ROOT = Path(env("VAULT_ROOT", "/vault"))
 DOCS_ROOT = Path(env("DOCS_ROOT", "/documents"))
 CACHE_ROOT = Path(env("CACHE_ROOT", "/cache"))  # text extracts + SQLite index
@@ -32,8 +33,12 @@ def incoming_root() -> Path:
     return VAULT_ROOT / ".incoming"
 
 
-def index_path() -> Path:
-    return CACHE_ROOT / "index.sqlite"
+DB_PATH = Path(env("DB_PATH", "/db/vault.db"))  # the vault itself: one SQLite file
+EMBED_MODEL = env("EMBED_MODEL", "BAAI/bge-small-en-v1.5")  # fastembed model; empty = hashed bag of words
+
+
+def db_path() -> Path:
+    return DB_PATH
 
 
 # Public URL of this server: MCP at /mcp, OAuth, file links (/f, /d) and uploads (/u).
@@ -60,5 +65,4 @@ SQL_TIMEOUT_SECONDS = float(env("SQL_TIMEOUT_SECONDS", "5"))
 # Worker
 WORKER_INTERVAL = int(env("WORKER_INTERVAL_SECONDS", "10"))
 DROP_SETTLE_SECONDS = int(env("DROP_SETTLE_SECONDS", "30"))  # leave files Syncthing is still writing
-COMMIT_QUIET_SECONDS = int(env("COMMIT_QUIET_SECONDS", "60"))  # commit out-of-band edits once they settle
 PUSH_INTERVAL = int(env("PUSH_INTERVAL_SECONDS", "900"))  # git push to the mirror; 0 = never

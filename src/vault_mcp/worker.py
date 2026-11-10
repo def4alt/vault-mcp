@@ -2,10 +2,9 @@
 
 Each cycle (every WORKER_INTERVAL seconds):
   1. drop folder      files dropped into Agent/inbox (Syncthing, Hermes) -> filing.file()
-  2. autocommit       edits made in Obsidian/SilverBullet, once they have settled
-  3. index            vault pages and history every cycle; documents (with text extraction)
-                      and lint findings (`problems`) every few cycles
-  4. push             the vault to its git mirror every PUSH_INTERVAL
+  2. publish          anything still marked touched is re-derived, exported and committed
+  3. derive           the blob listing every cycle; documents (text extraction, embeddings) every few cycles
+  4. push             the export to its git mirror every PUSH_INTERVAL
   5. prune            expired upload tickets, abandoned partial files, unused text extracts
 
 Every step is idempotent; a crash or restart picks up where it left off.
@@ -15,26 +14,23 @@ Every step is idempotent; a crash or restart picks up where it left off.
 """
 from __future__ import annotations
 
-import collections
 import logging
 import sys
 import time
 
 from prometheus_client import Counter, Gauge, start_http_server
 
-from . import config, documents, filing, incoming, index, repo
-from .lint import lint
-from .vault import Vault
+from . import config, documents, filing, incoming, repo, store
 
 log = logging.getLogger("vault-worker")
-SLOW_EVERY = 6  # documents and lint every SLOW_EVERY cycles (~1 min)
+SLOW_EVERY = 6  # documents and pruning every SLOW_EVERY cycles (~1 min)
 
 FILED = Counter("vault_worker_files_total", "Files handled by the worker", ["outcome"])
 ERRORS = Counter("vault_worker_errors_total", "Failed worker cycles")
 DROP_AGE = Gauge("vault_drop_oldest_seconds", "Age of the oldest file waiting in the drop folder")
 STORED_BYTES = Gauge("vault_stored_bytes", "Bytes in the blob store")
-INDEXED = Gauge("vault_index_items", "Items in the index", ["table"])
-PROBLEMS = Gauge("vault_problems", "Lint findings", ["kind"])
+INDEXED = Gauge("vault_index_items", "Rows in the vault", ["table"])
+PROBLEMS = Gauge("vault_problems", "Rows of the problems view", ["kind"])
 LAST_RUN = Gauge("vault_worker_last_run_timestamp_seconds", "End of the last successful cycle")
 LAST_PUSH = Gauge("vault_last_push_timestamp_seconds", "Last successful push to the git mirror")
 _reported: set[str] = set()  # problem kinds seen so far, so a fixed kind drops to 0
@@ -57,36 +53,6 @@ def process_drop_folder(now: float) -> float:
     return oldest
 
 
-def _changed_paths() -> list[str]:
-    entries = iter(repo.git("status", "--porcelain", "-z", "--untracked-files=all").split("\0"))
-    paths = []
-    for entry in entries:
-        if len(entry) > 3:
-            paths.append(entry[3:])
-            if entry[0] in "RC":  # renames and copies are followed by their source path
-                next(entries, None)
-    return [p for p in paths if ".sync-conflict-" not in p]  # conflict copies stay out of history
-
-
-def autocommit(now: float) -> str | None:
-    """Commit what people changed outside the MCP server, once nothing changed for a while."""
-    paths = _changed_paths()
-    if not paths:
-        return None
-    mtimes = [(config.VAULT_ROOT / p).stat().st_mtime for p in paths if (config.VAULT_ROOT / p).exists()]
-    if mtimes and now - max(mtimes) < config.COMMIT_QUIET_SECONDS:
-        return None
-    with repo.locked():  # the MCP server stages and commits its own batches under the same lock
-        repo.git("add", "-A", "--", ".", ":!*.sync-conflict-*")
-        if not repo.git("diff", "--cached", "--name-only").strip():
-            return None
-        repo.git("-c", "user.name=vault autocommit", "-c", "user.email=vault-autocommit@def4alt.com",
-                 "commit", "-q", "-m", "autocommit: edits from Obsidian/SilverBullet")
-        sha = repo.git("rev-parse", "--short", "HEAD").strip()
-    log.info("autocommitted %d paths as %s", len(paths), sha)
-    return sha
-
-
 def push() -> None:
     if not repo.git("remote").split():
         return
@@ -100,22 +66,22 @@ def run_once(cycle: int = 0, last_push: float = 0.0) -> float:
         d.mkdir(parents=True, exist_ok=True)
     now = time.time()
     DROP_AGE.set(process_drop_folder(now))
-    autocommit(now)
-    with index.connect() as conn:
-        index.sync_vault(conn)
-        index.sync_commits(conn)
+    with repo.locked(), store.connect() as conn:
+        store.check_model(conn)
+        store.sync_blobs(conn)
+        store.publish(conn, "export: pages changed outside a write")
+    with store.connect() as conn:
         if cycle % SLOW_EVERY == 0:
-            index.sync_documents(conn, extract=True)
-            problems = lint(Vault(config.VAULT_ROOT))
-            index.set_problems(conn, problems)
-            kinds = collections.Counter(p.kind for p in problems)
+            store.sync_documents(conn, extract=True)
+            kinds = dict(conn.execute("SELECT kind, count(*) FROM problems GROUP BY kind").fetchall())
             for kind in _reported | set(kinds):
                 PROBLEMS.labels(kind).set(kinds.get(kind, 0))
             _reported.update(kinds)
-            documents.prune_text_cache(index.known_hashes(conn))
+            hashes = {r[0] for r in conn.execute("SELECT sha256 FROM files UNION SELECT sha256 FROM documents")}
+            documents.prune_text_cache(hashes)
             incoming.prune(now)
             STORED_BYTES.set(incoming.usage())
-        for table in ("notes", "documents", "commits", "problems"):
+        for table in ("pages", "facts", "documents", "chunks"):
             INDEXED.labels(table).set(conn.execute(f"SELECT count(*) FROM {table}").fetchone()[0])
     if config.PUSH_INTERVAL and now - last_push >= config.PUSH_INTERVAL:
         push()

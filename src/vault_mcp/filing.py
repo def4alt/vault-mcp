@@ -1,21 +1,22 @@
-"""Filing: every incoming file becomes an immutable blob plus one file note in the graph.
+"""Filing: every incoming file becomes an immutable blob plus one page that describes it.
 
     blobs/<sha256[:16]>.<ext>   the bytes, named by content, never renamed (not in git)
-    files/<slug>.md             frontmatter (tags, categories, about, related...) + summary + embed
+    pages  files/<slug>         what the file is; `files` holds blob, hash, type, size and earlier versions
 
 Uploads (signed PUTs), URL fetches, ChatGPT attachments and the drop folder all go through file().
-A new version of a file replaces the blob of its note; the earlier blobs stay, listed in `versions`.
+A new version of a file replaces the blob of its page; the earlier blobs stay, listed in `versions`.
 """
 from __future__ import annotations
 
 import datetime as dt
+import json
 import os
 import re
 import shutil
+import unicodedata
 from pathlib import Path
 
-from . import config, documents, index, repo
-from .vault import render, slugify, split_frontmatter, unique_path
+from . import config, documents, repo, store
 
 
 def origin_of(client: str) -> str:
@@ -27,13 +28,10 @@ def origin_of(client: str) -> str:
     return "manual"
 
 
-def note_for_hash(sha: str) -> str | None:
-    """The file note for a blob, read straight from files/ so it is never stale."""
-    for f in sorted((config.VAULT_ROOT / "files").glob("*.md")):
-        meta, _ = split_frontmatter(f.read_text("utf-8", "replace"))
-        if meta.get("sha256") == sha:
-            return f"files/{f.stem}"
-    return None
+def slugify(text: str, max_len: int = 80) -> str:
+    text = unicodedata.normalize("NFKD", text).encode("ascii", "ignore").decode().replace("'", "")
+    slug = re.sub(r"[^a-z0-9]+", "-", text.lower()).strip("-")
+    return slug if len(slug) <= max_len else slug[:max_len].rsplit("-", 1)[0]
 
 
 def _extension(name: str) -> str:
@@ -57,60 +55,61 @@ def store_blob(src: Path, sha: str, name: str) -> str:
     raise RuntimeError(f"hash collision storing {name}")
 
 
-def _replace(src: Path, sha: str, note: str, original_name: str, added_by: str) -> dict:
-    """src (consumed) as the new version of an existing file note: same note, same page URL."""
-    path = config.VAULT_ROOT / f"{note}.md"
-    with repo.locked():
-        if not path.is_file():
-            src.unlink()
-            raise documents.DocumentError(f"no file note `{note}` to replace")
-        meta, body = split_frontmatter(path.read_text("utf-8"))
-        if meta.get("sha256") == sha:
-            src.unlink()
-            return {"note": note, "blob": None, "duplicate": True}
-        old, size = str(meta.get("blob") or ""), src.stat().st_size
-        blob = store_blob(src, sha, original_name)
-        preview = (documents.text_for(config.VAULT_ROOT / blob, sha) or "")[:800].strip()
-        versions = [b for b in dict.fromkeys([old, *(meta.get("versions") or [])]) if b and b != blob]
-        meta.update(as_of=dt.date.today(), media=documents.media_of(original_name), size=size,
-                    mime=documents.mime_of(original_name), original_name=original_name, blob=blob, sha256=sha,
-                    versions=versions)
-        body = body.replace(f"![[{old}]]", f"![[{blob}]]") if old else body
-        body = re.sub(r"## Preview\n\n.*?(?=\n## |\Z)", lambda _: f"## Preview\n\n{preview}\n", body, flags=re.S)
-        path.write_text(render(meta, body), "utf-8")
-        repo.commit([f"{note}.md"], f"file: new version of {note} ({added_by})", "vault-worker")
-    index.reindex([f"{note}.md"])
-    return {"note": note, "blob": blob, "duplicate": False}
+def _preview(blob: str, sha: str) -> str:
+    text = (documents.text_for(config.VAULT_ROOT / blob, sha) or "")[:800].strip()
+    return f"\n\n## Preview\n\n{text}" if text else ""
 
 
 def file(src: Path, *, original_name: str, origin: str, added_by: str, purpose: str = "",
          url: str | None = None, tags: list[str] | None = None, replaces: str | None = None) -> dict:
     """File src (consumed) into the vault. Returns {"note", "blob", "duplicate"}.
-    With replaces (a file note, files/<name>), src becomes that note's new version instead."""
-    sha = documents.sha256_of(src)
-    if replaces:
-        return _replace(src, sha, replaces, original_name, added_by)
-    if existing := note_for_hash(sha):
-        src.unlink()
-        return {"note": existing, "blob": None, "duplicate": True}
-    size, media, mime = src.stat().st_size, documents.media_of(original_name), documents.mime_of(original_name)
-    blob = store_blob(src, sha, original_name)
-    text = documents.text_for(config.VAULT_ROOT / blob, sha)
-    preview = (text or "")[:800].strip()
-    today = dt.date.today().isoformat()
-    size_label = f"{size / 1024**2:.1f} MB" if size >= 1024**2 else f"{size / 1024:.0f} KB"
-    meta = {
-        "kind": "file", "as_of": today, "tags": sorted(set(tags or [])) or None, "origin": origin,
-        "media": media, "mime": mime, "size": size, "original_name": original_name, "blob": blob,
-        "sha256": sha, "url": url,
-        "summary": purpose.strip() or f"{original_name} ({media}, {size_label}), not described yet.",
-    }
-    body = (f"# {original_name}\n\n![[{blob}]]\n\nAdded by {added_by} on {today}."
-            + (f"\n\n{purpose.strip()}" if purpose.strip() else "")
-            + (f"\n\n## Preview\n\n{preview}" if preview else ""))
-    with repo.locked():
-        note = unique_path(config.VAULT_ROOT, "files", slugify(Path(original_name).stem, 60) or "file")
-        (config.VAULT_ROOT / f"{note}.md").write_text(render(meta, body), "utf-8")
-        repo.commit([f"{note}.md"], f"file: {original_name} ({added_by})", "vault-worker")
-    index.reindex([f"{note}.md"])
+    With replaces (a file page, files/<name>), src becomes that page's new version instead."""
+    sha, size = documents.sha256_of(src), src.stat().st_size
+    mime = documents.mime_of(original_name)
+    with repo.locked(), store.connect() as conn:
+        if replaces:
+            old = conn.execute("SELECT * FROM files WHERE id = ?", (replaces,)).fetchone()
+            if old is None:
+                src.unlink()
+                raise documents.DocumentError(f"no file page `{replaces}` to replace")
+            if old["sha256"] == sha:
+                src.unlink()
+                return {"note": replaces, "blob": None, "duplicate": True}
+            blob = store_blob(src, sha, original_name)
+            versions = [b for b in dict.fromkeys([old["blob"], *json.loads(old["versions"])]) if b != blob]
+            body = conn.execute("SELECT body FROM pages WHERE id = ?", (replaces,)).fetchone()["body"]
+            body = re.sub(r"\n*## Preview\n\n.*?(?=\n## |\Z)", "", body.replace(f"![[{old['blob']}]]", f"![[{blob}]]"),
+                          flags=re.S).rstrip() + _preview(blob, sha)
+            conn.execute("BEGIN IMMEDIATE")
+            conn.execute("UPDATE files SET blob = ?, sha256 = ?, mime = ?, size = ?, name = ?, versions = ? "
+                         "WHERE id = ?", (blob, sha, mime, size, original_name, json.dumps(versions), replaces))
+            conn.execute("UPDATE pages SET body = ? WHERE id = ?", (body, replaces))
+            note, message = replaces, f"file: new version of {replaces} ({added_by})"
+        else:
+            if existing := conn.execute("SELECT id FROM files WHERE sha256 = ?", (sha,)).fetchone():
+                src.unlink()
+                return {"note": existing["id"], "blob": None, "duplicate": True}
+            blob = store_blob(src, sha, original_name)
+            today = dt.date.today().isoformat()
+            size_label = f"{size / 1024**2:.1f} MB" if size >= 1024**2 else f"{size / 1024:.0f} KB"
+            about = purpose.strip() or f"{original_name} ({documents.media_of(original_name)}, {size_label}), " \
+                                       "not described yet."
+            body = (f"{about}\n\n![[{blob}]]\n\nAdded by {added_by} ({origin}) on {today}"
+                    + (f" from {url}" if url else "") + "."
+                    + (f"\n\nTags: {', '.join(sorted(set(tags)))}" if tags else "") + _preview(blob, sha))
+            base = f"files/{slugify(Path(original_name).stem, 60) or 'file'}"
+            note, n = base, 2
+            while conn.execute("SELECT 1 FROM pages WHERE id = ?", (note,)).fetchone():
+                note, n = f"{base}-{n}", n + 1
+            conn.execute("BEGIN IMMEDIATE")
+            conn.execute("INSERT INTO pages (id, title, body) VALUES (?, ?, ?)", (note, original_name, body))
+            conn.execute("INSERT INTO files VALUES (?, ?, ?, ?, ?, ?, '[]')", (note, blob, sha, mime, size,
+                                                                                original_name))
+            message = f"file: {original_name} ({added_by})"
+        conn.execute("INSERT INTO log (actor, message, changed) VALUES (?, ?, ?)",
+                     (added_by, message, json.dumps([note])))
+        conn.execute("COMMIT")
+        store.sync_blobs(conn)
+        sha_commit = store.publish(conn, message, "vault-worker")
+        conn.execute("UPDATE log SET sha = ? WHERE id = (SELECT max(id) FROM log)", (sha_commit,))
     return {"note": note, "blob": blob, "duplicate": False}

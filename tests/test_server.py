@@ -1,7 +1,6 @@
-"""Behaviour of the vault server, seen from its clients: tool calls, HTTP, files on disk and git."""
+"""Behaviour of the vault server, seen from its clients: tool calls, HTTP, the database, the export and git."""
 import functools
 import http.server
-import shutil
 import socket
 import subprocess
 import threading
@@ -16,30 +15,12 @@ from fastmcp import Client
 from fastmcp.client.transports import StreamableHttpTransport
 from fastmcp.exceptions import ToolError
 
-from vault_mcp import config, incoming, signing, worker
+from vault_mcp import config, incoming, markdown, signing, store, worker
 from vault_mcp.app.server import build
-from vault_mcp.lint import lint
-from vault_mcp.vault import Vault
 
-SKELETON = Path(__file__).parent / "fixture"
-
-FACT = """---
-kind: fact
-status: unreviewed
-as_of: 2026-10-12
-categories: [careers]
-tags: [work]
-about: ["[[notes/acme]]"]
-summary: I work at Acme.
----
-# I work at Acme
-"""
-ENTITY = """---
-kind: entity
-summary: Acme, a company.
----
-# Acme
-"""
+ACME = ("INSERT INTO pages (id, title, body) VALUES (?, ?, ?)", ["notes/acme", "Acme", "A company in Munich."])
+JOB = ("INSERT INTO facts (subject, claim, valid_from, confirmed, source) VALUES (?, ?, ?, ?, ?)",
+       ["notes/acme", "I work at Acme.", "2026-01-01", "2026-01-02", "[[sources/chat]]"])
 
 
 def git(root, *args):
@@ -59,17 +40,18 @@ def env(tmp_path, monkeypatch):
     monkeypatch.setenv("GIT_CONFIG_GLOBAL", str(tmp_path / "gitconfig"))  # no signing or hooks from the host
     monkeypatch.setenv("GIT_CONFIG_NOSYSTEM", "1")
     root = tmp_path / "vault"
-    shutil.copytree(SKELETON, root)
+    root.mkdir()
+    (root / ".gitignore").write_text("blobs/\n.incoming/\n")
     git(tmp_path, "init", "-q", "-b", "main", str(root))
     git(root, "add", "-A")
     git(root, "-c", "user.name=t", "-c", "user.email=t@t", "commit", "-qm", "seed")
     docs = tmp_path / "documents"
     for d in ("Agent/inbox", "University"):
         (docs / d).mkdir(parents=True)
-    settings = {"VAULT_ROOT": root, "DOCS_ROOT": docs, "CACHE_ROOT": tmp_path / "cache", "LINK_SECRET": "s3cret",
+    settings = {"VAULT_ROOT": root, "DOCS_ROOT": docs, "CACHE_ROOT": tmp_path / "cache",
+                "DB_PATH": tmp_path / "db/vault.db", "EMBED_MODEL": "", "LINK_SECRET": "s3cret",
                 "PUBLIC_URL": "https://vault.example", "NOTES_BASE_URL": "https://notes.example",
-                "GITHUB_CLIENT_ID": "", "API_KEYS": {}, "DROP_SETTLE_SECONDS": 0, "COMMIT_QUIET_SECONDS": 0,
-                "PUSH_INTERVAL": 0}
+                "GITHUB_CLIENT_ID": "", "API_KEYS": {}, "DROP_SETTLE_SECONDS": 0, "PUSH_INTERVAL": 0}
     for name, value in settings.items():
         monkeypatch.setattr(config, name, value)
     return root, docs
@@ -86,8 +68,11 @@ async def wire(tool, **args) -> dict:
         return (await c.call_tool(tool, args)).structured_content
 
 
-async def write(path, content, message="edit: test", **change):
-    return await call("write", changes=[{"path": path, "content": content, **change}], message=message)
+async def write(*statements, message="edit: test", many=False, **kw):
+    """Statements are SQL strings or (sql, params) pairs."""
+    sts = [{"sql": s, "many": many} if isinstance(s, str) else {"sql": s[0], "params": s[1], "many": many}
+           for s in statements]
+    return await call("write", statements=sts, message=message, **kw)
 
 
 async def rows(query, *params, **kw):
@@ -98,138 +83,129 @@ def commits(root) -> int:
     return int(git(root, "rev-list", "--count", "HEAD"))
 
 
-# --- reading ---------------------------------------------------------------------------
+# --- the two primitives ----------------------------------------------------------------
 
-async def test_search_ranks_and_answers_in_the_shape_chatgpt_expects(env):
-    await write("notes/acme", ENTITY)
-    await write("notes/i-work-at-acme", FACT)
-    await write("notes/acme-history", ENTITY.replace("# Acme", "# Acme was founded in 1999").replace(
-        "kind: entity", "kind: evergreen"))
-    top = (await wire("search", query="work acme"))["results"][0]
-    assert set(top) == {"id", "title", "text", "url"} and "Acme" in top["text"]
-    assert top["id"] == "notes/i-work-at-acme" and top["url"] == "https://notes.example/notes/i-work-at-acme"
-    assert [r.id for r in (await call("search", query='"founded in 1999"')).results] == ["notes/acme-history"]
-    either = [r.id for r in (await call("search", query="1999 work")).results]  # no page has both words
-    assert set(either) == {"notes/acme-history", "notes/i-work-at-acme"}
-
-
-async def test_fetch_reads_pages_old_versions_and_suggests_on_a_miss(env):
-    root, _ = env
-    first = await write("notes/acme", ENTITY)
-    await write("notes/acme", ENTITY.replace("a company", "a company in Munich"))
-    page = await call("fetch", id="notes/acme")
-    assert "Munich" in page.text and page.metadata["rev"] == git(root, "hash-object", "notes/acme.md").strip()
-    assert "Munich" not in (await call("fetch", id=f"notes/acme@{first.commit}")).text
-    with pytest.raises(ToolError, match="closest: notes/acme"):
-        await call("fetch", id="notes/acme-inc")
-
-
-async def test_sql_answers_questions_about_links_tags_fields_and_history(env):
-    await write("notes/acme", ENTITY)
-    await write("notes/i-work-at-acme", FACT, "ingest: job")
-    assert await rows("SELECT src, field FROM links WHERE dst = ?", "notes/acme") == [
-        {"src": "notes/i-work-at-acme", "field": "about"}]
-    assert await rows("SELECT id FROM tags WHERE tag = 'work'") == [{"id": "notes/i-work-at-acme"}]
-    assert await rows("SELECT id FROM notes WHERE json_extract(fm, '$.categories[0]') = 'careers'") == [
-        {"id": "notes/i-work-at-acme"}]
-    history = await rows("SELECT f.id FROM commits c JOIN commit_files f USING (sha) WHERE c.message LIKE 'ingest%'")
-    assert history == [{"id": "notes/i-work-at-acme"}]
-    hits = await rows("SELECT id, snippet(fts, 3, '[', ']', '…', 8) AS s FROM fts WHERE fts MATCH 'work' "
-                      "ORDER BY bm25(fts)")
-    assert hits[0]["id"] == "notes/i-work-at-acme" and "[work]" in hits[0]["s"]
-
-
-async def test_sql_is_read_only_single_statement_and_bounded(env, monkeypatch):
-    for statement in ("INSERT INTO notes(id) VALUES ('x')", "DELETE FROM notes", "ATTACH 'x.db' AS x",
-                      "PRAGMA journal_mode = DELETE", "SELECT 1; SELECT 2"):
-        with pytest.raises(ToolError):
-            await call("sql", sql=statement)
-    monkeypatch.setattr(config, "SQL_TIMEOUT_SECONDS", 0.2)
-    with pytest.raises(ToolError, match="longer than"):
-        await call("sql", sql="WITH RECURSIVE n(i) AS (SELECT 1 UNION ALL SELECT i + 1 FROM n) SELECT max(i) FROM n")
-    for n in range(3):
-        await write(f"notes/thing-{n}", ENTITY.replace("# Acme", f"# Thing {n}"))
-    page = await call("sql", sql="SELECT id FROM notes ORDER BY id", limit=2)
-    assert page.truncated and [r["id"] for r in page.rows] == ["notes/thing-0", "notes/thing-1"]
-    rest = await call("sql", sql="SELECT id FROM notes ORDER BY id", limit=2, cursor=page.next_cursor)
-    assert not rest.truncated and [r["id"] for r in rest.rows] == ["notes/thing-2"]
-    clipped = (await rows("SELECT printf('%.5000c', 'x') AS long"))[0]["long"]
-    assert len(clipped) < 2200 and "substr" in clipped
-
-
-# --- writing ---------------------------------------------------------------------------
-
-async def test_a_batch_is_one_commit_or_nothing(env):
+async def test_a_write_is_one_transaction_one_log_row_and_one_commit_of_the_export(env):
     root, _ = env
     before = commits(root)
-    with pytest.raises(ToolError, match="frontmatter does not match"):
-        await call("write", message="ingest", changes=[
-            {"path": "notes/acme", "content": ENTITY},
-            {"path": "notes/bad", "content": ENTITY.replace("kind: entity", "kind: nonsense")}])
-    assert not (root / "notes/acme.md").exists() and commits(root) == before
-    result = await call("write", message="ingest", changes=[
-        {"path": "notes/acme", "content": ENTITY}, {"path": "notes/i-work-at-acme", "content": FACT}])
-    assert commits(root) == before + 1 and set(result.revs) == {"notes/acme.md", "notes/i-work-at-acme.md"}
+    done = await write(ACME, JOB, message="ingest: job")
+    assert done.changed == ["notes/acme"] and done.rows == 2 and commits(root) == before + 1
+    assert await rows("SELECT claim, confirmed FROM current_facts WHERE subject = 'notes/acme'") == [
+        {"claim": "I work at Acme.", "confirmed": "2026-01-02"}]
+    exported = (root / "notes/acme.md").read_text()
+    assert exported.startswith("# Acme\n\nA company in Munich.\n") and "| I work at Acme. | 2026-01-01 |" in exported
+    assert "ingest: job" in git(root, "log", "-1", "--format=%s")
+    log = await rows("SELECT actor, message, changed, sha FROM log")
+    assert log == [{"actor": "mcp", "message": "ingest: job", "changed": '["notes/acme"]', "sha": done.commit}]
+    with pytest.raises(ToolError, match="valid_from must be YYYY-MM-DD"):  # the second statement fails: nothing stays
+        await write(("INSERT INTO pages (id, title) VALUES ('notes/beta', 'Beta')", None),
+                    ("INSERT INTO facts (subject, claim, valid_from) VALUES ('notes/beta', 'x', 'last year')", None))
+    assert await rows("SELECT id FROM pages") == [{"id": "notes/acme"}] and commits(root) == before + 1
 
 
-async def test_base_rev_keeps_agents_from_overwriting_each_other(env):
-    root, _ = env
-    rev = (await write("notes/acme", ENTITY, base_rev="new")).revs["notes/acme.md"]
-    (root / "notes/acme.md").write_text(ENTITY.replace("a company", "edited in Obsidian"))
-    with pytest.raises(ToolError, match="changed since you read it"):
-        await write("notes/acme", ENTITY.replace("a company", "my version"), base_rev=rev)
-    with pytest.raises(ToolError, match="changed since you read it"):
-        await write("notes/acme", ENTITY, base_rev="new")
-    fresh = (await call("fetch", id="notes/acme")).metadata["rev"]
-    await write("notes/acme", ENTITY.replace("a company", "merged"), base_rev=fresh)
-    assert "merged" in (root / "notes/acme.md").read_text()
+async def test_write_takes_row_changes_and_nothing_else(env):
+    await write(ACME)
+    for bad, reason in (("DROP TABLE pages", "not allowed"), ("UPDATE log SET actor = 'me'", "not allowed"),
+                        ("INSERT INTO files (id, blob, sha256) VALUES ('notes/acme', 'b', 's')", "not allowed"),
+                        ("INSERT INTO facts (subject, claim, valid_from) VALUES ('notes/nope', 'x', '2026-01-01')",
+                         "existing page"),
+                        ("INSERT INTO pages (id, title) VALUES ('Not A Slug!', 'x')", "page id"),
+                        ("UPDATE pages SET body = '| # | Claim | From | Until | Confirmed | Source | Note |' "
+                         "WHERE id = 'notes/acme'", "facts table"),
+                        ("UPDATE facts SET valid_until = '2020-01-01' WHERE 1", None)):
+        if reason:
+            with pytest.raises(ToolError, match=reason):
+                await write(bad)
+    with pytest.raises(ToolError, match="read-only"):
+        await call("sql", sql="DELETE FROM pages")
+    await write(*[(ACME[0], [f"notes/p{i}", f"P{i}", ""]) for i in range(25)])
+    with pytest.raises(ToolError, match="would change 26 rows"):
+        await write("UPDATE pages SET private = 1")
+    assert (await write("UPDATE pages SET private = 1", many=True)).rows == 26
 
 
 async def test_a_retried_write_is_applied_once(env):
     root, _ = env
-    args = {"changes": [{"path": "notes/acme", "content": ENTITY}], "message": "add acme", "idempotency_key": "k-1"}
-    first = await call("write", **args)
-    (root / "notes/acme.md").write_text(ENTITY.replace("a company", "later edit"))
-    again = await call("write", **args)
-    assert again.replayed and again.commit == first.commit
-    assert "later edit" in (root / "notes/acme.md").read_text()
+    first = await write(ACME, idempotency_key="k1")
+    again = await write(ACME, idempotency_key="k1")
+    assert again.replayed and again.commit == first.commit and again.changed == ["notes/acme"]
+    assert len(await rows("SELECT id FROM pages")) == 1
 
 
-async def test_move_rewrites_links_and_patches_touch_only_frontmatter(env):
+async def test_renames_and_deletes_follow_through_and_git_keeps_the_past(env):
     root, _ = env
-    await write("notes/acme", ENTITY)
-    await write("notes/i-work-at-acme", FACT)
-    before = commits(root)
-    await call("write", message="rename", changes=[
-        {"path": "notes/acme", "move_to": "notes/acme-corp"},
-        {"path": "notes/i-work-at-acme", "frontmatter": {"set": {"status": "confirmed", "reviewed": "2026-10-13"}}}])
-    fact = (root / "notes/i-work-at-acme.md").read_text()
-    assert commits(root) == before + 1 and not (root / "notes/acme.md").exists()
-    assert "[[notes/acme-corp]]" in fact and "status: confirmed" in fact and fact.endswith("# I work at Acme\n")
+    first = await write(ACME, JOB, ("INSERT INTO pages (id, title, body) VALUES ('notes/me', 'Me', "
+                                    "'I work at [[notes/acme]] and [[notes/acme|there]].')", None))
+    await write("UPDATE pages SET id = 'notes/acme-gmbh' WHERE id = 'notes/acme'")
+    assert (await rows("SELECT body FROM pages WHERE id = 'notes/me'"))[0]["body"] == \
+        "I work at [[notes/acme-gmbh]] and [[notes/acme-gmbh|there]]."
+    assert await rows("SELECT subject FROM facts") == [{"subject": "notes/acme-gmbh"}]
+    assert await rows("SELECT src FROM links WHERE dst = 'notes/acme-gmbh'") == [{"src": "notes/me"}]
+    assert not (root / "notes/acme.md").exists() and "acme-gmbh" in (root / "notes/me.md").read_text()
+    stale = (await rows("SELECT updated FROM pages WHERE id = 'notes/me'"))[0]["updated"]
+    await write(("UPDATE pages SET body = 'new' WHERE id = 'notes/me' AND updated = ?", [stale]))
+    lost = await write(("UPDATE pages SET body = 'mine' WHERE id = 'notes/me' AND updated = ?", [stale]))
+    assert lost.rows == 0 and (await rows("SELECT body FROM pages WHERE id = 'notes/me'"))[0]["body"] == "new"
+    await write("DELETE FROM pages WHERE id = 'notes/acme-gmbh'")
+    assert await rows("SELECT count(*) AS n FROM facts") == [{"n": 0}]
+    assert not (root / "notes/acme-gmbh.md").exists()
+    assert "I work at Acme." in (await call("fetch", id=f"notes/acme@{first.commit}")).text
 
 
-async def test_content_is_never_screened_and_sources_can_be_corrected(env):
-    source = ("---\nkind: source\norigin: manual\nsource_kind: snapshot\nas_of: 2026-10-12\nsummary: s\n---\n"
-              "# Snapshot\n\nCall +49 151 55435105 or see [[topics]]\n")
-    first = await write("sources/snap", source)  # a phone number that passes the card checksum
-    assert "+49 151 55435105" in (await call("fetch", id="sources/snap")).text
-    fixed = source.replace("[[topics]]", "[[notes/topics]]")
-    await write("sources/snap", fixed, base_rev=first.revs["sources/snap.md"])
-    assert "[[notes/topics]]" in (await call("fetch", id="sources/snap")).text
-    await call("write", message="notes", changes=[{"path": "notes/pw", "content": ENTITY.replace(
-        "# Acme", "# Wifi\n\npassword: hunter2hunter2")}])
+# --- the two queries every client needs -------------------------------------------------
+
+async def test_search_ranks_by_keywords_and_meaning_and_a_fact_is_a_hit_of_its_own(env):
+    await write(ACME, JOB, ("INSERT INTO pages (id, title, body) VALUES ('notes/alps', 'Alps', "
+                            "'Hiking trips in the mountains near Garmisch.')", None))
+    top = (await wire("search", query="where do I work"))["results"][0]
+    assert set(top) == {"id", "title", "text", "url"} and top["id"] == "notes/acme#fact-1"
+    assert "I work at Acme." in top["text"] and "still true" in top["text"] and top["title"] == "Acme"
+    assert top["url"] == "https://notes.example/notes/acme"
+    assert (await call("search", query="mountains hiking")).results[0].id == "notes/alps"
+    page = await call("fetch", id=top["id"])
+    assert page.id == "notes/acme" and "| 1 | I work at Acme. | 2026-01-01 |" in page.text
+    assert page.metadata["private"] is False and page.metadata["updated"]
+    by_meaning = await rows("SELECT ref FROM chunks ORDER BY cosine(embedding, embed(?)) DESC LIMIT 1",
+                            "a company in Munich")
+    assert by_meaning == [{"ref": "notes/acme"}]
+    by_words = await rows("SELECT c.ref FROM fts JOIN chunks c ON c.id = fts.rowid WHERE fts MATCH 'garmisch'")
+    assert by_words == [{"ref": "notes/alps"}]
+    with pytest.raises(ToolError, match="closest: notes/acme"):
+        await call("fetch", id="notes/acme-inc")
 
 
-async def test_delete_removes_pages_and_only_files_nothing_refers_to(env):
+async def test_problems_and_the_question_queue_are_queries(env):
+    await write(ACME, ("INSERT INTO facts (subject, claim, valid_from, confirmed) VALUES "
+                       "('notes/acme', 'Acme has 10 employees.', '2020-01-01', '2020-01-02')", None),
+                ("INSERT INTO pages (id, title, body) VALUES ('notes/me', 'Me', 'See [[notes/nowhere]].')", None),
+                ("INSERT INTO questions (question, about, asked_by) VALUES ('Is Acme still in Munich?', "
+                 "'notes/acme', 'claude')", None),
+                ("INSERT INTO queries VALUES ('open', 'SELECT question FROM questions WHERE answer IS NULL', "
+                 "'Open questions')", None))
+    problems = await rows("SELECT kind, id FROM problems ORDER BY kind, id")
+    assert problems == [{"kind": "broken-link", "id": "notes/me"}, {"kind": "orphan", "id": "notes/acme"},
+                        {"kind": "question", "id": "questions#1"}, {"kind": "stale", "id": "notes/acme#fact-1"}]
+    saved = (await rows("SELECT sql FROM queries WHERE name = 'open'"))[0]["sql"]
+    assert await rows(saved) == [{"question": "Is Acme still in Munich?"}]
+    assert "Is Acme still in Munich?" in (await call("fetch", id="questions")).text
+    await write("UPDATE questions SET answer = 'Yes', answered = date('now') WHERE id = 1",
+                "UPDATE facts SET confirmed = date('now') WHERE id = 1")
+    assert await rows(saved) == []
+    assert [p["kind"] for p in await rows("SELECT kind FROM problems ORDER BY kind")] == ["broken-link", "orphan"]
+
+
+async def test_the_export_is_a_way_back(env, tmp_path, monkeypatch):
     root, _ = env
-    first = await write("notes/acme", ENTITY)
-    await call("delete", paths=["notes/acme"], message="duplicate")
-    assert not (root / "notes/acme.md").exists()
-    assert "Acme" in (await call("fetch", id=f"notes/acme@{first.commit}")).text
-    (root / "blobs").mkdir(exist_ok=True)
-    (root / "blobs/0123456789abcdef.pdf").write_bytes(b"%PDF")
-    await call("delete", paths=["blobs/0123456789abcdef.pdf"], message="unused")
-    assert not (root / "blobs/0123456789abcdef.pdf").exists()
+    await write(ACME, JOB, "UPDATE pages SET private = 1 WHERE id = 'notes/acme'",
+                ("INSERT INTO questions (question, asked_by) VALUES ('Why?', 'me')", None),
+                ("INSERT INTO queries VALUES ('all', 'SELECT id FROM pages', 'Every page')", None))
+    before = {t: await rows(f"SELECT * FROM {t} ORDER BY 1") for t in ("facts", "questions", "queries")}
+    page = await rows("SELECT id, title, body, private FROM pages")
+    monkeypatch.setattr(config, "DB_PATH", tmp_path / "db/rebuilt.db")
+    with store.connect() as conn:
+        assert markdown.import_all(conn, root) == 1
+    assert {t: await rows(f"SELECT * FROM {t} ORDER BY 1") for t in before} == before
+    assert await rows("SELECT id, title, body, private FROM pages") == page
 
 
 # --- files -----------------------------------------------------------------------------
@@ -264,9 +240,10 @@ async def test_an_agent_with_a_shell_uploads_by_running_the_returned_curl(server
     (tmp_path / "report.txt").write_text("revenue went up")
     out = subprocess.run(ticket.curl, shell=True, cwd=tmp_path, capture_output=True, text=True, check=True).stdout
     assert '"note":"files/report"' in out.replace(" ", "")
-    note = (root / "files/report.md").read_text()
-    assert "origin: hermes" in note and "Q3 numbers" in note and "- finance" in note
+    page = (root / "files/report.md").read_text()
+    assert "(hermes)" in page and "Q3 numbers" in page and "Tags: finance" in page and "revenue went up" in page
     assert git(root, "ls-files", "blobs") == "" and "files/report.md" in git(root, "ls-files", "files")
+    assert (await call("search", query="revenue")).results[0].id == "files/report"
     again = httpx2.put(ticket.put_url.replace("{filename}", "copy.txt"), content=b"revenue went up")
     assert again.status_code == 200 and again.json() == {"note": "files/report", "duplicate": True}
     forged = ticket.put_url.replace("{filename}", "x.txt").replace("s=", "s=A")
@@ -319,30 +296,30 @@ async def test_an_html_file_is_a_page_whose_url_stays_across_new_versions(server
     assert '"note":"files/report"' in out.replace(" ", "") and commits(root) == before + 1
     status, v2 = shown(server, "/report")
     assert status == 200 and v2 != v1 and (root / "blobs" / v2).read_text() == PAGE.format("went down")
-    note = (await call("fetch", id="files/report"))
-    assert note.url == note.metadata["view_url"] == "https://pages.example/report/"
-    assert note.metadata["versions"] == [f"blobs/{v1}"] and note.metadata["summary"] == "Q3 numbers"
-    assert "went down" in note.text and "went up" not in note.text  # the preview follows the new version
-    assert await rows("SELECT view FROM files") == [{"view": "https://pages.example/report/"}]
+    page = await call("fetch", id="files/report")
+    assert page.url == page.metadata["view_url"] == "https://pages.example/report/"
+    assert page.metadata["versions"] == [f"blobs/{v1}"] and "Q3 numbers" in page.text
+    assert "went down" in page.text and "went up" not in page.text  # the preview follows the new version
+    assert await rows("SELECT page_url(id) AS view FROM files") == [{"view": "https://pages.example/report/"}]
 
     async with hermes(server) as c:  # the same bytes again change nothing
         again = (await c.call_tool("upload", {"filename": "report.html", "replaces": "files/report"})).data
     assert httpx2.put(again.put_url.replace("{filename}", "report.html"), content=PAGE.format("went down")).json() \
         == {"note": "files/report", "duplicate": True, "view_url": "https://pages.example/report/"}
-    with pytest.raises(ToolError, match="versions"):  # earlier versions are kept, not orphans
-        await call("delete", paths=[f"blobs/{v1}"], message="tidy: old version")
-    assert not [p for p in lint(Vault(root)) if p.kind == "blob"]
+    with pytest.raises(ToolError, match="belongs to a file page"):  # earlier versions are kept, not orphans
+        await write(("DELETE FROM blobs WHERE name = ?", [v1]))
+    assert await rows("SELECT * FROM problems WHERE kind = 'blob'") == []
 
     gallery = httpx2.get(f"{server}/_pages").text
     assert 'href="/report/"' in gallery and "Q3 &amp; Q4 report" in gallery and "Q3 numbers" in gallery
 
 
-async def test_only_html_file_notes_are_pages(server, env, tmp_path, monkeypatch):
+async def test_only_html_files_are_pages(server, env, tmp_path, monkeypatch):
     monkeypatch.setattr(config, "PAGES_URL", "https://pages.example")
     (tmp_path / "plan.pdf").write_bytes(b"%PDF-1.4 plan")
     async with hermes(server) as c:
         ticket = (await c.call_tool("upload", {"filename": "plan.pdf"})).data
-        with pytest.raises(ToolError, match="not a file note"):
+        with pytest.raises(ToolError, match="not a file page"):
             await c.call_tool("upload", {"filename": "x.html", "replaces": "notes/acme"})
     out = subprocess.run(ticket.curl, shell=True, cwd=tmp_path, capture_output=True, text=True, check=True).stdout
     assert "view_url" not in out
@@ -367,26 +344,34 @@ async def test_urls_and_chatgpt_attachments_are_pulled_by_the_server(env, tmp_pa
         assert attached.duplicate and attached.note == "files/paper"
     finally:
         httpd.shutdown()
-    files = await rows("SELECT id, name, mime, url FROM files")
+    files = await rows("SELECT id, name, mime, link(blob, name) AS url FROM files")
     assert files[0]["mime"] == "application/pdf" and files[0]["url"].startswith("https://vault.example/f/")
 
 
-async def test_the_worker_files_drops_commits_outside_edits_and_reports_problems(env):
+async def test_an_unused_stored_file_is_removed_by_deleting_its_row(env):
+    root, _ = env
+    (root / "blobs").mkdir()
+    (root / "blobs/0123456789abcdef.pdf").write_bytes(b"%PDF")
+    worker.run_once()
+    assert await rows("SELECT id FROM problems WHERE kind = 'blob'") == [{"id": "blobs/0123456789abcdef.pdf"}]
+    await write("DELETE FROM blobs WHERE name = '0123456789abcdef.pdf'")
+    assert not (root / "blobs/0123456789abcdef.pdf").exists()
+
+
+# --- worker ----------------------------------------------------------------------------
+
+async def test_the_worker_files_drops_and_publishes_what_is_left_touched(env):
     root, docs = env
     (docs / "Agent/inbox/deck.pptx").write_bytes(b"PK slides")
-    (root / "notes/typed-in-obsidian.md").write_text(ENTITY.replace("# Acme", "# Typed\n\nSee [[notes/nowhere]]"))
-    (root / "notes/acme.sync-conflict-20261013-ABC.md").write_text("conflict copy")
+    with store.connect() as conn:  # a change made behind the tools' back, e.g. by a script
+        conn.execute("INSERT INTO pages (id, title, body) VALUES ('notes/typed', 'Typed', 'By hand.')")
     worker.run_once()
     assert not (docs / "Agent/inbox/deck.pptx").exists()
     deck = await rows("SELECT mime FROM files WHERE name = 'deck.pptx'")
     assert deck == [{"mime": "application/vnd.openxmlformats-officedocument.presentationml.presentation"}]
-    assert "autocommit" in git(root, "log", "-1", "--format=%s", "--", "notes/typed-in-obsidian.md")
-    assert "sync-conflict" not in git(root, "ls-files")
-    problems = await rows("SELECT kind, id FROM problems WHERE kind IN ('broken-link', 'sync-conflict') ORDER BY kind")
-    assert problems == [{"kind": "broken-link", "id": "notes/typed-in-obsidian"},
-                        {"kind": "sync-conflict", "id": "notes/acme.sync-conflict-20261013-ABC.md"}]
-    await call("delete", paths=["notes/acme.sync-conflict-20261013-ABC.md"], message="merged")
-    assert not (root / "notes/acme.sync-conflict-20261013-ABC.md").exists()
+    assert (root / "notes/typed.md").read_text().startswith("# Typed")
+    assert git(root, "log", "-1", "--format=%s", "--", "notes/typed.md")  # exported and committed
+    assert (await call("search", query="typed by hand")).results[0].id == "notes/typed"
 
 
 async def test_documents_are_searchable_readable_and_confined(env):
@@ -397,7 +382,7 @@ async def test_documents_are_searchable_readable_and_confined(env):
     hit = (await call("search", query="population coding")).results[0]
     assert hit.id == "doc:University/lecture.docx" and hit.url.startswith("https://vault.example/d/University/")
     assert "Population coding & noise" in (await call("fetch", id=hit.id)).text
-    for item in ("doc:../vault/AGENTS.md", "doc:.stversions/x", ".git/config"):
+    for item in ("doc:../vault/AGENTS.md", "doc:.stversions/x", ".git/config", "notes/x@HEAD:../.git/config"):
         with pytest.raises(ToolError):
             await call("fetch", id=item)
 
@@ -418,50 +403,3 @@ def test_only_known_api_keys_get_in(server):
     assert post().status_code == 401 and post("wrong").status_code == 401
     ok = post("hermes-key")
     assert ok.status_code == 200 and '"serverInfo"' in ok.text
-
-
-# --- fact tables ---------------------------------------------------------------------------
-
-FACTS = """---
-kind: entity
-summary: Acme, a company.
----
-# Acme
-
-## Facts
-
-| Fact | From | Until | Status | Reviewed | Recheck | Source | Note |
-|---|---|---|---|---|---|---|---|
-| I worked at Acme as an intern. | 2024-01-01 | 2024-06-30 | confirmed | 2024-07-01 | never | [[notes/acme]] | a \\| b |
-| I work at Acme. | 2025-01-01 |  | confirmed | 2025-01-02 | 90d |  |  |
-| Acme moves to Berlin. | 2026-01-01 |  | needs-update |  | 180d |  | Did it? |
-"""
-
-
-async def test_facts_are_rows_with_a_validity_period_and_a_recheck_interval(env):
-    await write("notes/acme", FACTS)
-    facts = await rows("SELECT n, claim, valid_until, status, note, current FROM facts ORDER BY n")
-    assert [f["current"] for f in facts] == [0, 1, 1]
-    assert facts[0]["valid_until"] == "2024-06-30" and facts[0]["note"] == "a | b"
-    assert await rows("SELECT claim FROM facts WHERE current AND status = 'confirmed'") == [
-        {"claim": "I work at Acme."}]
-    hit = (await call("search", query="where do I work now")).results[0]  # a fact is a search hit of its own
-    assert hit.id == "notes/acme#fact-2" and "still true" in hit.text
-    assert (await call("fetch", id=hit.id)).id == "notes/acme"
-    # problems are fresh right after the write: the open question, and the confirmed fact past its recheck
-    problems = await rows("SELECT kind, detail FROM problems WHERE id = 'notes/acme' "
-                          "AND kind IN ('conflict', 'stale') ORDER BY kind")
-    assert [p["kind"] for p in problems] == ["conflict", "stale"]
-    assert "Did it?" in problems[0]["detail"] and "I work at Acme." in problems[1]["detail"]
-    await write("notes/acme", FACTS.replace("| needs-update |  |", "| confirmed | 2026-11-01 |").replace(
-        "| 2025-01-02 | 90d |", "| 2025-01-02 | never |"))
-    assert await rows("SELECT kind FROM problems WHERE id = 'notes/acme' AND kind IN ('conflict', 'stale')") == []
-
-
-async def test_a_malformed_fact_row_is_refused(env):
-    for broken, reason in ((FACTS.replace("| 2025-01-01 |", "| last year |"), "From must be"),
-                           (FACTS.replace("| needs-update |", "| maybe |"), "Status"),
-                           (FACTS.replace("| 2025-01-02 | 90d |", "|  | 90d |"), "needs the date"),
-                           (FACTS.replace("a \\| b", "a | b"), "cells")):
-        with pytest.raises(ToolError, match=reason):
-            await write("notes/acme", broken)

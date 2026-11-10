@@ -10,9 +10,10 @@ from pydantic import BaseModel, Field
 
 
 class SearchResult(BaseModel):
-    id: str = Field(description="Pass to fetch(). Pages: notes/x, files/x...; documents: doc:<path>")
+    id: str = Field(description="Pass to fetch(). A page (notes/x), one fact (notes/x#fact-12) or a document "
+                                "(doc:<path>)")
     title: str
-    text: str = Field(description="Matching passage")
+    text: str = Field(description="The matching passage, or the fact with its validity period")
     url: str = Field(description="Where a person opens it; cite this")
 
 
@@ -27,8 +28,8 @@ class Document(BaseModel):
     text: str
     url: str
     metadata: dict[str, Any] = Field(default_factory=dict, description=(
-        "Frontmatter, rev (pass as base_rev to write), backlinks, download_url for files, view_url for "
-        "pages (HTML files), next_offset when the text continues"))
+        "updated (pass it back in a WHERE to avoid overwriting someone else's edit), private, backlinks, "
+        "download_url and versions for files, view_url for HTML pages, next_offset when the text continues"))
 
 
 class SqlResult(BaseModel):
@@ -38,23 +39,16 @@ class SqlResult(BaseModel):
     next_cursor: str | None = None
 
 
-class FrontmatterPatch(BaseModel):
-    set: dict[str, Any] = {}
-    unset: list[str] = []
-
-
-class Change(BaseModel):
-    path: str = Field(description="Vault path, e.g. notes/my-note or files/slides (.md is implied)")
-    content: str | None = Field(None, description="The whole new file: frontmatter + body")
-    frontmatter: FrontmatterPatch | None = Field(None, description="Change only these frontmatter fields")
-    move_to: str | None = Field(None, description="Rename/move the page; links to it are rewritten everywhere")
-    base_rev: str | None = Field(None, description=(
-        "rev you read (fetch metadata.rev or notes.rev); refused if the page changed since. 'new' = must not exist"))
+class Statement(BaseModel):
+    sql: str = Field(description="One INSERT, UPDATE or DELETE on pages, facts, questions or queries")
+    params: list[Any] | dict[str, Any] | None = Field(None, description="Values for ? or :name placeholders")
+    many: bool = Field(False, description="Set when the statement is meant to change more than 20 rows")
 
 
 class WriteResult(BaseModel):
-    commit: str
-    revs: dict[str, str | None] = Field(description="New rev of every path touched (null = deleted)")
+    commit: str = Field(description="Git commit of the Markdown export of this change")
+    changed: list[str] = Field(description="Ids of the pages (and tables) the statements touched")
+    rows: int = Field(0, description="Rows inserted, updated or deleted")
     replayed: bool = Field(False, description="True when this idempotency_key was already applied; nothing changed")
 
 
@@ -67,9 +61,9 @@ class FileRef(BaseModel):
 
 
 class UploadResult(BaseModel):
-    note: str | None = Field(None, description="The file note created (or found, if the file was already there)")
+    note: str | None = Field(None, description="The file page created (or found, if the file was already there)")
     duplicate: bool | None = None
     view_url: str | None = Field(None, description="Stable link to open an HTML file (a page) in a browser")
     put_url: str | None = Field(None, description="HTTP PUT target; replace {filename} (URL-encoded)")
-    curl: str | None = Field(None, description="Ready upload command; prints the file note as JSON")
+    curl: str | None = Field(None, description="Ready upload command; prints the file page as JSON")
     expires_at: str | None = None

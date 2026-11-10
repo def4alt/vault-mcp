@@ -18,19 +18,19 @@ from prometheus_client import start_http_server
 from starlette.requests import Request
 from starlette.responses import HTMLResponse, JSONResponse, PlainTextResponse, Response
 
-from .. import config, documents, filing, incoming, pages, signing
+from .. import config, documents, filing, incoming, pages, signing, store
 from .auth import Gatekeeper, build_auth
 from .tools import vault
 
 # Clients may only show the first ~500 characters: the essentials come first.
 INSTRUCTIONS = (
-    "Andrii's knowledge vault: Markdown pages in git (notes/, sources/, projects/, files/), linked with "
-    "[[wikilinks]], plus his documents. Read with `search` then `fetch`; query anything structured (tags, links, "
-    "history, problems, files) with `sql`. Change pages with `write` (one commit; pass base_rev) and `delete`. "
-    "Add files with `upload`. Never put file bytes in tool calls: with a shell, use curl on the links.\n\n"
+    "Andrii's knowledge vault: one SQLite database of pages, dated facts about them, a question queue and "
+    "stored files, plus his documents. Read with `search` (keywords and meaning) then `fetch`, or ask anything "
+    "with `sql`. Change rows with `write`: plain INSERT, UPDATE and DELETE statements, one transaction and one "
+    "git commit per call. Add files with `upload`; never put file bytes in tool calls.\n\n"
     "You are a trusted collaborator working alongside other agents (Claude, ChatGPT, Hermes) in the same vault. "
-    "Capture what you learn, link it, describe and tag files you add. Conventions: fetch('AGENTS'). The server "
-    "only insists on valid paths and schema-valid frontmatter (vault://schema); the rest is your judgment."
+    "Start with fetch('notes/current-situation'); conventions are in fetch('AGENTS'), the schema in "
+    "vault://schema. When unsure about a fact, add a row to `questions` instead of guessing."
 )
 STATUS_TEXT = {403: "invalid link\n", 410: "link expired\n"}
 
@@ -89,8 +89,9 @@ async def put_file(request: Request) -> Response:
 
 
 async def healthz(_: Request) -> PlainTextResponse:
-    ok = (config.VAULT_ROOT / "AGENTS.md").exists()
-    return PlainTextResponse("ok\n" if ok else "vault missing\n", status_code=200 if ok else 503)
+    with store.connect() as conn:
+        ok = conn.execute("SELECT 1 FROM pages WHERE id = 'AGENTS'").fetchone() is not None
+    return PlainTextResponse("ok\n" if ok else "vault empty\n", status_code=200 if ok else 503)
 
 
 def build() -> FastMCP:

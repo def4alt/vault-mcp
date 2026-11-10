@@ -1,38 +1,26 @@
-"""The six tools: search, fetch and sql to read; write and delete to change; upload to bring files in.
+"""The tools. Two primitives, `sql` to read and `write` to change rows; the rest are conveniences:
+`search` and `fetch` are the two queries every client needs, `upload` moves file bytes.
 
-Pages are Markdown files in git; files are content-addressed blobs described by file notes;
-everything is linked with wikilinks and mirrored into a read-only SQLite index.
+The vault is one SQLite database (store.py). Everything an agent can know or do is a query.
 """
 from __future__ import annotations
 
 import datetime as dt
+import json
 import re
 import shlex
 import urllib.parse
 from functools import partial
-from pathlib import Path
 from typing import Any
 
 import anyio
-import yaml
 from fastmcp import Context, FastMCP
 from fastmcp.exceptions import ToolError
 from mcp import types as mt
 
-from .. import config, documents, filing, incoming, index, pages, repo, rules, signing
-from ..vault import DATE_KEYS, PAGE_DIRS, render, split_frontmatter
+from .. import config, documents, filing, incoming, markdown, pages, repo, signing, store
 from .auth import author, client_name
-from .models import (
-    Change,
-    Document,
-    FileRef,
-    FrontmatterPatch,
-    SearchResult,
-    SearchResults,
-    SqlResult,
-    UploadResult,
-    WriteResult,
-)
+from .models import Document, FileRef, SearchResult, SearchResults, SqlResult, Statement, UploadResult, WriteResult
 
 vault = FastMCP("vault-tools")
 TEXT_PAGE = 20_000  # characters per fetch
@@ -51,45 +39,78 @@ def _url(item_id: str) -> str:
             return signing.document_link(item_id.removeprefix("doc:"), config.CITATION_TTL)
         except documents.DocumentError:
             pass
-    return f"{config.NOTES_BASE_URL}/{urllib.parse.quote(item_id.removeprefix('doc:'))}"
+    return f"{config.NOTES_BASE_URL}/{urllib.parse.quote(item_id.removeprefix('doc:').split('#')[0])}"
 
 
 def _iso(ts: float) -> str:
     return dt.datetime.fromtimestamp(ts, dt.UTC).isoformat(timespec="seconds")
 
 
-# --- reading ---------------------------------------------------------------------------
+# --- the two primitives ----------------------------------------------------------------
+
+@vault.tool(annotations=_annotations("Query the vault with SQL", read_only=True))
+def sql(sql: str, params: list[Any] | dict[str, Any] | None = None, limit: int = 100,
+        cursor: str | None = None) -> SqlResult:
+    """Read anything: one SELECT/WITH over the vault database (SQLite), 5 s, rows as objects, ? params.
+    pages(id, title, body, private, updated); facts(id, subject=page id, claim, valid_from, valid_until,
+    confirmed, source, note) and the view current_facts; questions(id, question, about, asked, asked_by,
+    answer, answered); files(id, blob, sha256, mime, size, name, versions); queries(name, sql, about): saved
+    queries, run their sql; log(time, actor, message, changed, sha); links(src, dst); problems(kind, id, detail);
+    documents(id 'doc:<path>', path, folder, name, media, mime, size); chunks(ref, page, title, text,
+    embedding): every paragraph, fact and document passage, with fts(title, text) over the same rowids.
+    Functions: embed(text) and cosine(a, b) for meaning, link(blob_or_doc_id) for a download URL.
+    E.g. SELECT claim FROM current_facts WHERE subject = 'notes/seoul' |
+    SELECT ref, text, cosine(embedding, embed('where do I live')) AS score FROM chunks ORDER BY score DESC
+    LIMIT 5 | SELECT c.ref, c.text FROM fts JOIN chunks c ON c.id = fts.rowid WHERE fts MATCH 'thesis'
+    ORDER BY bm25(fts) LIMIT 5 | SELECT * FROM problems. Long cells are clipped."""
+    offset = store.decode_cursor(cursor)
+    columns, rows, more = store.run_sql(sql, params, max(1, min(limit, 500)), offset)
+    return SqlResult(columns=columns, rows=rows, truncated=more,
+                     next_cursor=store.encode_cursor(offset + len(rows)) if more else None)
+
+
+@vault.tool(annotations=_annotations("Change rows", read_only=False, destructive=True, idempotent=False))
+def write(statements: list[Statement], message: str, ctx: Context, idempotency_key: str | None = None) -> WriteResult:
+    """Change the vault: INSERT, UPDATE and DELETE statements on pages, facts, questions and queries, run as
+    ONE transaction (all or nothing), logged and committed to git as one change. Examples:
+    INSERT INTO pages (id, title, body) VALUES ('notes/acme', 'Acme', 'A company in Munich. See [[notes/lio]].')
+    INSERT INTO facts (subject, claim, valid_from, source) VALUES ('notes/acme', 'I work at Acme.', '2026-01-01',
+      '[[sources/chat-2026-01-02]]')        -- unreviewed until I confirm it
+    UPDATE facts SET confirmed = date('now') WHERE id = 12            -- I confirmed it
+    UPDATE facts SET valid_until = '2026-11-30' WHERE id = 12         -- it stopped being true: never delete it
+    UPDATE pages SET body = ? WHERE id = 'notes/acme' AND updated = ? -- only if nobody changed it since I read it
+    UPDATE pages SET id = 'notes/acme-gmbh' WHERE id = 'notes/acme'   -- rename; links and facts follow
+    INSERT INTO questions (question, about, asked_by) VALUES ('Does X still hold?', 'notes/acme', 'claude')
+    DELETE FROM pages WHERE id = 'notes/acme'                         -- its facts go with it; git keeps history
+    DELETE FROM blobs WHERE name = '0123456789abcdef.pdf'             -- remove an unused stored file, for good
+    Constraints explain themselves when violated. A statement changing more than 20 rows needs many=true.
+    message: what and why, e.g. "ingest: SNU timetable". Conventions: fetch("AGENTS")."""
+    if not statements:
+        raise ToolError("no statements")
+    name, who = author(ctx)
+    result = store.apply([(s.sql, s.params, s.many) for s in statements], who, message, idempotency_key, name)
+    return WriteResult(**result)
+
+
+# --- the two queries every client needs -------------------------------------------------
 
 @vault.tool(annotations=_annotations("Search the vault", read_only=True))
 def search(query: str, limit: int = 10, cursor: str | None = None) -> SearchResults:
-    """Ranked full-text search over notes, sources, projects, file notes (including the text inside the
-    files) and documents. Words match as prefixes, "quoted phrases" exactly. Pages with all the words
-    come first; if none has all of them, pages with any are ranked. A hit `notes/x#fact-3` is one row of
-    that page's fact table (the text is the claim with its validity period). Then fetch(id). For filters,
-    tags, links, dates or counts use `sql`."""
-    offset = index.decode_cursor(cursor)
-    with index.connect() as conn:
-        index.sync_vault(conn)  # a stat scan: picks up edits made in Obsidian or SilverBullet
-        rows, more = index.search(conn, query, max(1, min(limit, 50)), offset)
+    """Search by keywords and by meaning at once, over page paragraphs, single facts, file contents and my
+    documents. A hit is a page (notes/x), one fact (notes/x#fact-12: the claim with its validity period) or
+    a document (doc:<path>). Then fetch(id). For exact filters, dates, counts or your own ranking use `sql`."""
+    offset = store.decode_cursor(cursor)
+    with store.connect() as conn:
+        rows, more = store.search(conn, query, max(1, min(limit, 50)), offset)
     return SearchResults(
-        results=[SearchResult(id=r["id"], title=r["title"] or r["id"], text=" ".join((r["snippet"] or "").split()),
+        results=[SearchResult(id=r["id"], title=r["title"] or r["id"], text=" ".join(r["text"].split())[:700],
                               url=_url(r["id"])) for r in rows],
-        next_cursor=index.encode_cursor(offset + len(rows)) if more else None)
-
-
-def _vault_file(item_id: str) -> Path | None:
-    root = config.VAULT_ROOT.resolve()
-    for candidate in (item_id, f"{item_id}.md"):
-        f = (root / candidate).resolve()
-        if root in f.parents and f.is_file() and not any(p.startswith(".") for p in Path(candidate).parts):
-            return f
-    return None
+        next_cursor=store.encode_cursor(offset + len(rows)) if more else None)
 
 
 def _closest(wanted: str) -> str:
-    with index.connect() as conn:
-        index.sync_vault(conn)
-        return ", ".join(index.suggest(conn, wanted)) or "none"
+    with store.connect() as conn:
+        return ", ".join(store.suggest(conn, wanted)) or "none"
 
 
 def _page(text: str, offset: int) -> tuple[str, dict]:
@@ -99,11 +120,10 @@ def _page(text: str, offset: int) -> tuple[str, dict]:
 
 @vault.tool(annotations=_annotations("Read a page, file or document", read_only=True))
 def fetch(id: str, offset: int = 0) -> Document:
-    """Full text of anything search or sql returned: a page (notes/x, files/x, AGENTS, index, views/x),
-    a page's stable uid, a document (doc:University/x.pdf), or an old version (notes/x@<commit>).
-    File notes include the extracted text of their file and a download_url; HTML file notes (pages)
-    also a view_url, which is their url. metadata.rev is what you pass as base_rev to write. Long texts
-    continue at metadata.next_offset."""
+    """Full text of anything search or sql returned: a page with its facts (notes/x, AGENTS, index), the
+    question queue (questions), a document (doc:University/x.pdf), or an old version (notes/x@<commit>, the
+    commit from `log.sha`). File pages include the extracted text of their file and a download_url; HTML
+    file pages also a view_url, which is their url. Long texts continue at metadata.next_offset."""
     item_id = id.strip().lstrip("/")
     if item_id.startswith("doc:"):
         p = documents.resolve(item_id.removeprefix("doc:"))
@@ -117,218 +137,34 @@ def fetch(id: str, offset: int = 0) -> Document:
                                   "size": p.stat().st_size, **more})
     if "@" in item_id:
         path, commit = item_id.rsplit("@", 1)
-        text = repo.show(commit, rules.normalise_path(path))
-        body, more = _page(text, offset)
+        if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9/_-]*", path) or not re.fullmatch(r"[0-9a-fA-F]{4,40}", commit):
+            raise ToolError(f"`{path}` is not a page id")
+        body, more = _page(repo.show(commit, f"{path}.md"), offset)
         return Document(id=item_id, title=path, text=body, url=_url(path), metadata={"commit": commit, **more})
-    item_id = item_id.split("#", 1)[0]  # a fact hit (notes/x#fact-3) reads its page
-    f = _vault_file(item_id)
-    if f is None:
-        with index.connect() as conn:
-            index.sync_vault(conn)
-            uid_path = index.by_uid(conn, item_id)
-        f = _vault_file(uid_path) if uid_path else None
-    if f is None:
-        raise ToolError(f"no page `{item_id}`; closest: {_closest(item_id)}")
-    data = f.read_bytes()
-    item_id = str(f.relative_to(config.VAULT_ROOT.resolve())).removesuffix(".md")
-    text = data.decode("utf-8", "replace")
-    fm, body = split_frontmatter(text)
-    meta: dict[str, Any] = {k: str(v) if isinstance(v, dt.date) else v for k, v in fm.items()}
-    meta["rev"] = repo.rev_of(data)
-    with index.connect() as conn:
-        meta["backlinks"] = index.backlinks(conn, item_id)[:50]
-    if item_id.startswith("files/") and fm.get("blob"):
-        blob = config.VAULT_ROOT / str(fm["blob"])
-        if blob.exists():
-            meta["download_url"] = signing.blob_link(str(fm["blob"]), str(fm.get("original_name") or blob.name))
-            if pages.is_page(fm) and (view := pages.url(item_id)):
-                meta["view_url"] = view
-            extracted = documents.text_for(blob, str(fm.get("sha256") or documents.sha256_of(blob)))
-            if extracted:
-                text += "\n\n## Extracted text\n\n" + extracted
-    title = (re.search(r"^# (.+)$", body, re.M) or [None, item_id])[1]
-    page, more = _page(text, offset)
-    return Document(id=item_id, title=title, text=page, url=meta.get("view_url") or _url(item_id),
+    item_id = item_id.split("#", 1)[0].removesuffix(".md")  # a fact hit (notes/x#fact-3) reads its page
+    with store.connect() as conn:
+        if item_id in ("questions", "queries"):
+            markdown.export_table(conn, item_id)
+            body, more = _page((config.VAULT_ROOT / f"{item_id}.md").read_text("utf-8"), offset)
+            return Document(id=item_id, title=item_id.title(), text=body, url=_url(item_id), metadata=more)
+        row = conn.execute("SELECT title, private, updated FROM pages WHERE id = ?", (item_id,)).fetchone()
+        if row is None:
+            raise ToolError(f"no page `{item_id}`; closest: {_closest(item_id)}")
+        text = markdown.page_text(conn, item_id)
+        meta: dict[str, Any] = {"updated": row["updated"], "private": bool(row["private"])}
+        meta["backlinks"] = [r[0] for r in conn.execute(
+            "SELECT DISTINCT src FROM links WHERE dst = ? ORDER BY src LIMIT 50", (item_id,))]
+        file = conn.execute("SELECT * FROM files WHERE id = ?", (item_id,)).fetchone()
+    if file and (blob := config.VAULT_ROOT / file["blob"]).exists():
+        meta["download_url"] = signing.blob_link(file["blob"], file["name"] or blob.name)
+        meta["versions"] = json.loads(file["versions"])
+        if file["mime"] == "text/html" and (view := pages.url(item_id)):
+            meta["view_url"] = view
+        if extracted := documents.text_for(blob, file["sha256"]):
+            text += "\n\n## Extracted text\n\n" + extracted
+    body, more = _page(text, offset)
+    return Document(id=item_id, title=row["title"], text=body, url=meta.get("view_url") or _url(item_id),
                     metadata={**meta, **more})
-
-
-@vault.tool(annotations=_annotations("Query the index with SQL", read_only=True))
-def sql(sql: str, params: list[Any] | None = None, limit: int = 100, cursor: str | None = None) -> SqlResult:
-    """Read-only SQLite over the vault index: one SELECT/WITH, 5 s, rows as objects, ? params.
-    notes(id=path, uid, folder, kind, status, title, summary, tags JSON, as_of, reviewed, blob, sha256, rev,
-    mtime, size, fm=frontmatter JSON); documents(id 'doc:<path>', path, folder, name, media, mime, size);
-    links(src, dst, field: body|embed|source|about|related|supersedes|projects); tags(id, tag);
-    facets(id, field, value); files(id, name, mime, size, tags, summary, blob, url=download link,
-    view=page URL of an HTML file);
-    fts(id, title, summary, body): FTS5 incl. text inside files; commits(sha, date, author, message);
-    commit_files(sha, id); problems(kind, id, detail); facts(page, n, claim, valid_from, valid_until, status,
-    reviewed, recheck, source, note, current): the rows of every page's `## Facts` table.
-    link(blob_or_doc_id) signs a download URL.
-    E.g. SELECT src FROM links WHERE dst = 'notes/acme' | SELECT id FROM tags WHERE tag = 'slides' |
-    SELECT page, claim FROM facts WHERE current AND status = 'unreviewed' | SELECT id, snippet(fts, 3, '[',
-    ']', '…', 12) FROM fts WHERE fts MATCH 'transformer' ORDER BY bm25(fts). Long cells are clipped."""
-    with index.connect() as conn:
-        index.sync_vault(conn)
-    offset = index.decode_cursor(cursor)
-    columns, rows, more = index.run_sql(sql, params, max(1, min(limit, 500)), offset)
-    return SqlResult(columns=columns, rows=rows, truncated=more,
-                     next_cursor=index.encode_cursor(offset + len(rows)) if more else None)
-
-
-# --- changing --------------------------------------------------------------------------
-
-def _read(path: str) -> str | None:
-    f = config.VAULT_ROOT / path
-    return f.read_text("utf-8") if f.is_file() else None
-
-
-def _patched(text: str, patch: FrontmatterPatch) -> str:
-    meta, body = split_frontmatter(text)
-    for k, v in patch.set.items():
-        meta[k] = dt.date.fromisoformat(v) if k in DATE_KEYS and isinstance(v, str) else v
-    for k in patch.unset:
-        meta.pop(k, None)
-    return render(meta, body)
-
-
-def _pages() -> list[str]:
-    root = config.VAULT_ROOT
-    return [str(f.relative_to(root)) for folder in (*PAGE_DIRS, "views", "")
-            for f in sorted((root / folder).glob("*.md"))]
-
-
-def _plan(changes: list[Change]) -> tuple[dict[str, str | None], set[str]]:
-    """Apply the changes to an in-memory overlay of the vault: (new contents by path, directly changed paths)."""
-    overlay: dict[str, str | None] = {}
-    direct: set[str] = set()
-
-    def current(p: str) -> str | None:
-        return overlay[p] if p in overlay else _read(p)
-
-    for c in changes:
-        path = rules.normalise_path(c.path)
-        if sum(x is not None for x in (c.content, c.frontmatter, c.move_to)) != 1:
-            raise ToolError(f"`{path}`: give exactly one of content, frontmatter or move_to")
-        now = current(path)
-        if c.base_rev is not None:
-            actual = repo.rev_of(now.encode()) if now is not None else None
-            if (c.base_rev == "new") != (now is None) or (c.base_rev != "new" and actual != c.base_rev):
-                raise ToolError(f"`{path}` changed since you read it (rev now {actual or 'absent'}); "
-                                "fetch it again and redo your change")
-        if c.content is not None:
-            overlay[path] = c.content.rstrip() + "\n"
-            direct.add(path)
-        elif c.frontmatter is not None:
-            if now is None:
-                raise ToolError(f"no page `{path}` to patch")
-            overlay[path] = _patched(now, c.frontmatter)
-            direct.add(path)
-        else:
-            dest = rules.normalise_path(c.move_to)
-            if now is None:
-                raise ToolError(f"no page `{path}` to move")
-            if current(dest) is not None:
-                raise ToolError(f"`{dest}` already exists")
-            overlay[dest], overlay[path] = now, None
-            direct.add(dest)
-            old, new = path.removesuffix(".md"), dest.removesuffix(".md")
-            pattern = re.compile(r"\[\[" + re.escape(old) + r"(?=[\]|#])")
-            for p in dict.fromkeys([*_pages(), *overlay]):
-                text = current(p)
-                if text and pattern.search(text):
-                    overlay[p] = pattern.sub(f"[[{new}", text)
-    return overlay, direct
-
-
-def _replay(key: str | None) -> WriteResult | None:
-    found = repo.commit_for_key(key) if key else None
-    if found is None:
-        return None
-    sha, paths = found
-    return WriteResult(commit=sha, revs={p: repo.rev_of(t.encode()) if (t := _read(p)) is not None else None
-                                         for p in paths}, replayed=True)
-
-
-@vault.tool(annotations=_annotations("Create, edit or move pages", read_only=False, idempotent=False))
-def write(changes: list[Change], message: str, ctx: Context, idempotency_key: str | None = None) -> WriteResult:
-    """Create, replace, patch or move pages as ONE commit, e.g. a whole ingest (source + facts + entity
-    + links). Each change has a path and exactly one of: content (the whole file, frontmatter + body),
-    frontmatter ({"set": {"status": "confirmed", "reviewed": "2026-10-13"}, "unset": [...]}), or
-    move_to (links to the page are rewritten across the vault). Pass base_rev from fetch/sql so you
-    never overwrite someone else's edit ("new" = must not exist yet). All-or-nothing: everything is
-    validated before anything is written. With idempotency_key, a retried call is applied only once.
-    message: what and why, e.g. "ingest: SNU timetable". Conventions: fetch("AGENTS")."""
-    if not changes:
-        raise ToolError("no changes")
-    name, who = author(ctx)
-    schema = yaml.safe_load((config.VAULT_ROOT / ".schema/notes.yaml").read_text())
-    with repo.locked():
-        if replay := _replay(idempotency_key):
-            return replay
-        overlay, direct = _plan(changes)
-        for path in sorted(direct):
-            rules.check_write(path, overlay[path], schema)
-        for path, text in overlay.items():
-            f = config.VAULT_ROOT / path
-            if text is None:
-                f.unlink(missing_ok=True)
-            else:
-                f.parent.mkdir(parents=True, exist_ok=True)
-                f.write_text(text, "utf-8")
-        sha = repo.commit(sorted(overlay), f"{message} ({who})", name, idempotency_key)
-    index.reindex(sorted(overlay))
-    return WriteResult(commit=sha, revs={p: repo.rev_of(t.encode()) if t is not None else None
-                                         for p, t in overlay.items()})
-
-
-def _refers(text: str | None, blob: str) -> bool:
-    """Whether a file note's frontmatter names blob as its file or one of its earlier versions."""
-    meta = split_frontmatter(text or "")[0]
-    return meta.get("blob") == blob or blob in (meta.get("versions") or [])
-
-
-@vault.tool(annotations=_annotations("Delete pages or unused files", read_only=False, destructive=True))
-def delete(paths: list[str], message: str, ctx: Context, idempotency_key: str | None = None) -> WriteResult:
-    """Delete pages that are wrong or redundant, in one commit (history keeps them: fetch("x@<commit>")
-    and write them back to restore). Deleting a file note keeps its file; a file no note refers to
-    any more (problems kind 'blob') can be deleted by its path, blobs/<hash>.<ext>, and so can a
-    Syncthing conflict copy (problems kind 'sync-conflict') once merged; those two are gone for good."""
-    if not paths:
-        raise ToolError("no paths")
-    name, who = author(ctx)
-    with repo.locked():
-        if replay := _replay(idempotency_key):
-            return replay
-        pages, blobs = [], []
-        for raw in paths:
-            if ".sync-conflict-" in raw:
-                copy = (config.VAULT_ROOT / raw.strip().lstrip("/")).resolve()
-                root = config.VAULT_ROOT.resolve()
-                if root not in copy.parents or ".git" in copy.relative_to(root).parts or not copy.is_file():
-                    raise ToolError(f"no conflict copy `{raw}`")
-                blobs.append(str(copy.relative_to(root)))
-                continue
-            if raw.strip().lstrip("/").startswith("blobs/"):
-                blob = raw.strip().lstrip("/")
-                if not signing.BLOB.fullmatch(blob.removeprefix("blobs/")) or not (config.VAULT_ROOT / blob).is_file():
-                    raise ToolError(f"no file `{blob}`")
-                if note := next((p for p in _pages() if p.startswith("files/") and _refers(_read(p), blob)), None):
-                    raise ToolError(f"`{blob}` belongs to {note.removesuffix('.md')}; delete that note, or drop "
-                                    "the blob from its versions, first")
-                blobs.append(blob)
-                continue
-            path = rules.normalise_path(raw)
-            old = _read(path)
-            if old is None:
-                raise ToolError(f"cannot delete `{path}`: it does not exist")
-            pages.append(path)
-        for path in pages:
-            (config.VAULT_ROOT / path).unlink()
-        sha = repo.commit(pages, f"{message} ({who})", name, idempotency_key) if pages else "none (not in git)"
-        for blob in blobs:
-            (config.VAULT_ROOT / blob).unlink()
-    index.reindex(pages)
-    return WriteResult(commit=sha, revs={p: None for p in pages + blobs})
 
 
 # --- files -----------------------------------------------------------------------------
@@ -337,23 +173,23 @@ def delete(paths: list[str], message: str, ctx: Context, idempotency_key: str | 
             meta={"openai/fileParams": ["file"]})
 async def upload(ctx: Context, purpose: str = "", tags: list[str] | None = None, url: str | None = None,
                  file: FileRef | None = None, filename: str = "file.pdf", replaces: str | None = None) -> UploadResult:
-    """Bring a file into the vault; it becomes a file note (files/<name>) that you then describe, tag and
+    """Bring a file into the vault; it becomes a file page (files/<name>) whose body you then describe and
     link. File bytes never go through this call:
-    - a public URL: pass url; the server downloads and files it, and returns the note.
+    - a public URL: pass url; the server downloads and files it, and returns the page.
     - a file attached in ChatGPT: pass it as file; same.
     - a file in your sandbox or on your machine: call with filename only, then run the returned curl
-      (or PUT to put_url with {filename} replaced). The response of each PUT names the note. One link
+      (or PUT to put_url with {filename} replaced). The response of each PUT names the page. One link
       takes many files for an hour; it needs network access to this server.
-    purpose and tags go into the file note. Already-stored content is recognised (duplicate).
-    replaces="files/<name>": the file becomes the new version of that note instead (same note, same
-    view_url; the earlier blob is kept in its `versions`). An HTML file is a page: the result has its
-    view_url, a stable link to open it in a browser. Conventions for pages: fetch("AGENTS")."""
+    purpose becomes the first line of the page. Already-stored content is recognised (duplicate).
+    replaces="files/<name>": the file becomes the new version of that page instead (same page, same
+    view_url; the earlier blob is kept in files.versions). An HTML file is a page a person can open: the
+    result has its view_url. Conventions for such pages: fetch("AGENTS")."""
     who = client_name(ctx)
     if replaces is not None:
-        replaces = rules.normalise_path(replaces).removesuffix(".md")
-        meta = split_frontmatter(_read(f"{replaces}.md") or "")[0]
-        if not replaces.startswith("files/") or meta.get("kind") != "file":
-            raise ToolError(f"`{replaces}` is not a file note; replaces takes files/<name>")
+        replaces = replaces.strip().lstrip("/").removesuffix(".md")
+        with store.connect() as conn:
+            if not conn.execute("SELECT 1 FROM files WHERE id = ?", (replaces,)).fetchone():
+                raise ToolError(f"`{replaces}` is not a file page; replaces takes files/<name>")
     await anyio.to_thread.run_sync(incoming.check_quota)
     if file is not None or url:
         source = file.download_url if file is not None else url
@@ -373,11 +209,12 @@ async def upload(ctx: Context, purpose: str = "", tags: list[str] | None = None,
 
 @vault.resource("vault://AGENTS", mime_type="text/markdown")
 def agents() -> str:
-    """How agents work in this vault: conventions, page kinds, linking."""
-    return (config.VAULT_ROOT / "AGENTS.md").read_text("utf-8")
+    """How agents work in this vault: the tables, the conventions, the saved queries."""
+    with store.connect() as conn:
+        return markdown.page_text(conn, "AGENTS") or "The AGENTS page is missing."
 
 
-@vault.resource("vault://schema", mime_type="text/yaml")
+@vault.resource("vault://schema", mime_type="text/plain")
 def schema() -> str:
-    """Frontmatter schema per folder and the category taxonomy."""
-    return (config.VAULT_ROOT / ".schema/notes.yaml").read_text("utf-8")
+    """The database schema: tables, constraints, views and triggers."""
+    return store.DDL

@@ -1,6 +1,6 @@
 [project]
 name = "vault-mcp"
-version = "0.6.1"
+version = "1.0.0"
 description = "MCP server for a personal Markdown knowledge vault"
 readme = "README.md"
 authors = [
@@ -11,14 +11,14 @@ dependencies = [
     "anyio>=4",
     "fastmcp==4.1.0",
     "prometheus-client>=0.21",
-    "pyyaml>=6",
+    "fastembed>=0.7",
+    "numpy>=2",
 ]
 
 [project.scripts]
 vault-mcp = "vault_mcp.app.server:main"
-vault-lint = "vault_mcp.lint:main"
 vault-worker = "vault_mcp.worker:main"
-vault-index = "vault_mcp.index:main"
+vault-import = "vault_mcp.markdown:main"
 
 [build-system]
 requires = ["uv_build>=0.11.18,<0.12.0"]
