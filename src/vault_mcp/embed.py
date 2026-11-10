@@ -29,6 +29,7 @@ def _model(repo: str, file: str):
     import onnxruntime as ort  # imported late: the hash fallback needs none of it
     from huggingface_hub import snapshot_download
     from tokenizers import Tokenizer
+    ort.disable_telemetry_events()
     root = config.CACHE_ROOT / "models" / repo.replace("/", "--")
     if not ((root / file).is_file() and (root / "tokenizer.json").is_file()):  # downloaded once, then offline
         snapshot_download(  # real files, not cache symlinks: onnxruntime wants the weights beside the graph

@@ -2,6 +2,7 @@
 import functools
 import http.server
 import socket
+import sqlite3
 import subprocess
 import threading
 import time
@@ -15,7 +16,7 @@ from fastmcp import Client
 from fastmcp.client.transports import StreamableHttpTransport
 from fastmcp.exceptions import ToolError
 
-from vault_mcp import config, documents, filing, incoming, markdown, signing, store, worker
+from vault_mcp import config, documents, filing, incoming, markdown, pages, signing, store, worker
 from vault_mcp.app.server import build
 
 ACME = ("INSERT INTO pages (id, title, body) VALUES (?, ?, ?)", ["notes/acme", "Acme", "A company in Munich."])
@@ -124,6 +125,36 @@ async def test_write_takes_row_changes_and_nothing_else(env):
     assert (await write("UPDATE pages SET private = 1", many=True)).rows == 26
 
 
+async def test_cte_writes_obey_the_row_guard_and_reads_or_returning_are_not_writes(env):
+    await write(*[(ACME[0], [f"notes/p{i}", f"P{i}", ""]) for i in range(25)])
+    statement = "WITH targets AS (SELECT id FROM pages) UPDATE pages SET private=1 WHERE id IN targets"
+    with pytest.raises(ToolError, match="would change 25 rows"):
+        await write(statement)
+    assert await rows("SELECT count(*) AS n FROM pages WHERE private=1") == [{"n": 0}]
+    assert (await write(statement, many=True)).rows == 25
+    for statement in ("SELECT 1", "UPDATE pages SET private=0 RETURNING id"):
+        with pytest.raises(ToolError, match="without RETURNING"):
+            await write(statement)
+    assert await rows("SELECT count(*) AS n FROM pages WHERE private=1") == [{"n": 25}]
+
+
+async def test_file_metadata_only_changes_through_page_cascades(env, tmp_path):
+    source = tmp_path / "report.txt"
+    source.write_text("original")
+    item = filing.file(source, original_name="report.txt", origin="manual", added_by="test")
+    with pytest.raises(ToolError, match="not allowed"):
+        await write("UPDATE files SET blob='blobs/not-the-file.txt'")
+    with pytest.raises(ToolError, match="not allowed"):
+        await write("DELETE FROM files")
+    with pytest.raises(ToolError, match="not allowed"):  # permissions must reset for each statement
+        await write("UPDATE pages SET title='New'", "UPDATE files SET name='changed.txt'")
+    await write("UPDATE pages SET id='files/renamed' WHERE id='files/report'")
+    assert await rows("SELECT id FROM files") == [{"id": "files/renamed"}]
+    await write("DELETE FROM pages WHERE id='files/renamed'")
+    assert await rows("SELECT id FROM files") == []
+    assert (env[0] / item["blob"]).read_text() == "original"  # deletion of the page does not delete its bytes
+
+
 async def test_a_retried_write_is_applied_once(env):
     root, _ = env
     first = await write(ACME, idempotency_key="k1")
@@ -201,6 +232,27 @@ async def test_fact_evidence_survives_clipped_previews_without_hiding_future_or_
     assert next(h for h in hits if h["id"] == "notes/acme")["fact"] is None
 
 
+async def test_search_batches_evidence_reads_instead_of_querying_per_hit(env):
+    await write(ACME, JOB)
+    with store.connect() as conn:
+        statements = []
+        conn.set_trace_callback(statements.append)
+        found, _ = store.search(conn, "where do I work", 10)
+    assert next(r for r in found if r["id"] == "notes/acme#fact-1")["fact"]["source"] == "[[sources/chat]]"
+    # SQLite may read its own FTS configuration while opening the virtual table.
+    assert len([s for s in statements if s.startswith("SELECT") and "fts_config" not in s]) == 3
+
+
+async def test_invalid_paging_is_refused(env):
+    await write(ACME)
+    for offset in (-1, 1.5, True, "3"):
+        cursor = store.encode_cursor(offset)
+        with pytest.raises(ToolError, match="invalid cursor"):
+            await call("search", query="Acme", cursor=cursor)
+    with pytest.raises(ToolError, match="offset must be non-negative"):
+        await call("fetch", id="notes/acme", offset=-1)
+
+
 async def test_keyword_search_survives_an_unavailable_embedding_model(env, monkeypatch):
     await write(ACME)
 
@@ -266,6 +318,70 @@ async def test_the_export_is_a_way_back(env, tmp_path, monkeypatch):
     assert await rows("SELECT id, title, body, private FROM pages") == page
 
 
+async def test_export_table_cells_preserve_literal_markup_and_aliases(env):
+    claim = "Literal <br> &amp; a|b and \\| punctuation\nNext line"
+    note = "carriage\rreturn\n<tag> and &quot;"
+    await write(ACME, ("INSERT INTO facts (subject,claim,valid_from,source,note) VALUES (?,?,?,?,?)",
+                      ["notes/acme", claim, "2026-01-01", "[[notes/acme|alias]]", note]))
+    parsed = markdown.parse((env[0] / "notes/acme.md").read_text())
+    assert parsed["facts"][0][1] == claim
+    assert parsed["facts"][0][5:] == ["[[notes/acme|alias]]", note]
+
+
+def test_table_cells_distinguish_null_empty_text_and_significant_whitespace():
+    values = [None, "", '""', " ", " leading and trailing ", "\t", "\u00a0", "\r\n", "&#32;", "<br>"]
+    assert markdown.read_table(markdown.table(["Value"], [[v] for v in values]), ["Value"]) == [[v] for v in values]
+
+
+async def test_fetching_saved_tables_does_not_write_the_export(env, monkeypatch):
+    await write(("INSERT INTO questions (question) VALUES ('Unanswered?')", None),
+                ("INSERT INTO queries VALUES ('all','SELECT id FROM pages','Every page')", None))
+
+    def forbidden(*_):
+        raise AssertionError("a read must not rewrite export files")
+
+    monkeypatch.setattr(markdown, "export_table", forbidden)
+    assert "Unanswered?" in (await call("fetch", id="questions")).text
+    assert "SELECT id FROM pages" in (await call("fetch", id="queries")).text
+
+
+async def test_failed_export_keeps_the_previous_complete_file(env, monkeypatch):
+    await write(ACME)
+    path = env[0] / "notes/acme.md"
+    original = path.read_text()
+    write_text = Path.write_text
+
+    def interrupted(self, text, *args, **kwargs):
+        if self.name == ".acme.md.tmp":
+            write_text(self, "partial", *args, **kwargs)
+            raise OSError("interrupted export")
+        return write_text(self, text, *args, **kwargs)
+
+    with monkeypatch.context() as patch:
+        patch.setattr(Path, "write_text", interrupted)
+        with store.connect() as conn:
+            with pytest.raises(OSError, match="interrupted export"):
+                markdown.export_page(conn, "notes/acme")
+    assert path.read_text() == original and not path.with_name(".acme.md.tmp").exists()
+
+
+def test_import_failure_rolls_back_and_malformed_rows_are_not_silently_dropped(env):
+    root, _ = env
+    (root / "notes").mkdir()
+    (root / "notes/acme.md").write_text("# Acme\n\nBody\n")
+    (root / "questions.md").write_text("# Questions\n\n" + markdown.table(markdown.QUESTION_COLUMNS, [
+        [1, "First?", None, "2026-01-01", None, None, None],
+        [1, "Duplicate ID", None, "2026-01-01", None, None, None]]))
+    with store.connect() as conn:
+        with pytest.raises(sqlite3.IntegrityError):
+            markdown.import_all(conn, root)
+        assert not conn.in_transaction
+        assert not conn.execute("SELECT 1 FROM pages").fetchone()
+    malformed = markdown.table(markdown.FACT_COLUMNS, []) + "\n| too | few | cells |"
+    with pytest.raises(ValueError, match="wrong number of cells"):
+        markdown.read_table(malformed, markdown.FACT_COLUMNS)
+
+
 # --- files -----------------------------------------------------------------------------
 
 @pytest.fixture
@@ -328,6 +444,12 @@ async def test_downloads_are_checked_for_caddy_before_it_serves_them(server, env
         signing.document_link(".incoming/x")
 
 
+def test_malformed_signatures_and_zero_ttl_are_not_server_errors(env):
+    link = signing.blob_link("blobs/0123456789abcdef.pdf", "Plan.pdf")
+    assert signing.verify(link.replace("s=", "s=%C3%A9")) == 403
+    assert signing.verify(signing.blob_link("blobs/0123456789abcdef.pdf", "Plan.pdf", ttl=0)) == 410
+
+
 PAGE = "<!doctype html><title>Q3 &amp; Q4 report</title><body><h1>Revenue {}</h1></body>"
 
 
@@ -388,6 +510,32 @@ async def test_only_html_files_are_pages(server, env, tmp_path, monkeypatch):
     assert shown(server, "/../files/plan/")[0] == 404 and shown(server, "/plan/", "POST")[0] == 405
 
 
+async def test_gallery_reads_html_inventory_once(env, tmp_path, monkeypatch):
+    for i in range(3):
+        path = tmp_path / f"report-{i}.html"
+        path.write_text(PAGE.format(i))
+        filing.file(path, original_name=path.name, origin="manual", added_by="test", purpose=f"Report {i}")
+    calls, inventory = [], pages._html_files
+
+    def counted():
+        calls.append(1)
+        return inventory()
+
+    monkeypatch.setattr(pages, "_html_files", counted)
+    assert len(pages.listing()) == 3 and len(calls) == 1
+
+
+async def test_gallery_skips_unservable_names_instead_of_advertising_broken_links(env, tmp_path, monkeypatch):
+    monkeypatch.setattr(config, "PAGES_URL", "https://pages.example")
+    path = tmp_path / "report.html"
+    path.write_text(PAGE.format("up"))
+    filing.file(path, original_name=path.name, origin="manual", added_by="test")
+    await write("UPDATE pages SET id='files/nested/report' WHERE id='files/report'")
+    assert pages.listing() == [] and pages.view_url("files/nested/report") is None
+    assert pages.url("notes/not-a-file") is None and pages.url(None) is None
+    assert (await call("fetch", id="files/nested/report")).metadata["download_url"]
+
+
 async def test_urls_and_chatgpt_attachments_are_pulled_by_the_server(env, tmp_path, monkeypatch):
     with pytest.raises(ToolError, match="non-public"):
         await call("upload", url="http://127.0.0.1:1/secret")
@@ -425,6 +573,43 @@ async def test_stored_blobs_are_description_only_without_any_extraction(env, tmp
     assert "payloadSentinel" not in page.text and "boilerplateSentinel" not in page.text
     assert await rows("SELECT rowid FROM fts WHERE fts MATCH 'payloadSentinel OR boilerplateSentinel'") == []
     assert (env[0] / filed["blob"]).read_bytes() == original
+
+
+def test_actual_blob_quota_is_enforced_but_duplicates_do_not_consume_it(env, tmp_path, monkeypatch):
+    monkeypatch.setattr(config, "QUOTA_BYTES", 5)
+    source = tmp_path / "data.txt"
+    source.write_bytes(b"12345")
+    first = filing.file(source, original_name="data.txt", origin="manual", added_by="test")
+    source.write_bytes(b"12345")
+    assert filing.file(source, original_name="copy.txt", origin="manual", added_by="test")["duplicate"]
+    source.write_bytes(b"6")
+    with pytest.raises(documents.DocumentError, match="quota"):
+        filing.file(source, original_name="more.txt", origin="manual", added_by="test")
+    assert source.read_bytes() == b"6" and (env[0] / first["blob"]).read_bytes() == b"12345"
+
+
+async def test_refused_upload_does_not_leave_a_partial_file(server, env, tmp_path, monkeypatch):
+    monkeypatch.setattr(config, "QUOTA_BYTES", 1)
+    async with hermes(server) as c:
+        ticket = (await c.call_tool("upload", {"filename": "data.txt"})).data
+    response = httpx2.put(ticket.put_url.replace("{filename}", "data.txt"), content=b"too large")
+    assert response.status_code == 409 and "quota" in response.text
+    assert not list((env[0] / ".incoming").glob("*.part"))
+
+
+async def test_document_fetches_share_the_extraction_cache(env, monkeypatch):
+    path = env[1] / "University/notes.txt"
+    path.write_text("raw")
+    calls = []
+
+    def extract(p):
+        calls.append(p)
+        return "Extracted evidence"
+
+    monkeypatch.setattr(documents, "extract_text", extract)
+    for _ in range(2):
+        assert "Extracted evidence" in (await call("fetch", id="doc:University/notes.txt")).text
+    assert calls == [path]
 
 
 async def test_html_documents_ignore_old_extracts_and_are_not_indexed(env):

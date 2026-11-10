@@ -12,6 +12,7 @@ Do not edit the files: the next export of a page overwrites them.
 from __future__ import annotations
 
 import argparse
+import html
 import json
 import re
 import sqlite3
@@ -32,11 +33,20 @@ def link_targets(text: str) -> list[str]:
 
 
 def _cell(value) -> str:
-    return "" if value is None else str(value).replace("|", "\\|").replace("\r", "").replace("\n", "<br>")
+    if value is None:
+        return ""
+    if value == "":
+        return '""'
+    text = html.escape(str(value)).replace("\\", "&#92;").replace("|", "\\|") \
+        .replace("\r", "&#13;").replace("\n", "<br>")
+    return re.sub(r"^ +| +$", lambda m: "&#32;" * len(m[0]), text)
 
 
 def _uncell(text: str) -> str | None:
-    text = text.strip().replace("\\|", "|").replace("<br>", "\n")
+    text = text.strip(" ")
+    if text == '""':
+        return ""
+    text = html.unescape(text.replace("\\|", "|").replace("<br>", "\n"))
     return text or None
 
 
@@ -47,13 +57,15 @@ def table(columns: list[str], rows: list[list]) -> str:
 
 
 def read_table(text: str, columns: list[str]) -> list[list[str | None]]:
-    """Rows of the first Markdown table in text whose header is `columns`."""
+    """Read a generated table with the given header; reject malformed rows."""
     lines = [ln for ln in text.splitlines() if ln.strip().startswith("|")]
     split = [[_uncell(c) for c in re.split(r"(?<!\\)\|", ln.strip().removeprefix("|").removesuffix("|"))]
              for ln in lines]
     if not split or [c or "" for c in split[0]] != columns:
         return []
-    return [row for row in split[2:] if len(row) == len(columns)]
+    if any(len(row) != len(columns) for row in split[2:]):
+        raise ValueError(f"malformed {columns[1]} table: wrong number of cells")
+    return split[2:]
 
 
 def render(page: sqlite3.Row, facts: list[sqlite3.Row], file: sqlite3.Row | None) -> str:
@@ -100,6 +112,17 @@ def page_text(conn: sqlite3.Connection, pid: str) -> str | None:
     return render(page, facts, conn.execute("SELECT * FROM files WHERE id = ?", (pid,)).fetchone())
 
 
+def _write_text(path: Path, text: str) -> None:
+    """Replace a generated file atomically; a failed export must not leave half a page."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_name(f".{path.name}.tmp")
+    try:
+        tmp.write_text(text, "utf-8")
+        tmp.replace(path)
+    finally:
+        tmp.unlink(missing_ok=True)
+
+
 def export_page(conn: sqlite3.Connection, pid: str) -> str:
     """Write (or remove) the export file of one page; returns its path in the repository."""
     path = f"{pid}.md"
@@ -108,13 +131,12 @@ def export_page(conn: sqlite3.Connection, pid: str) -> str:
     if text is None:
         f.unlink(missing_ok=True)
     else:
-        f.parent.mkdir(parents=True, exist_ok=True)
-        f.write_text(text, "utf-8")
+        _write_text(f, text)
     return path
 
 
-def export_table(conn: sqlite3.Connection, name: str) -> str:
-    """Write questions.md or queries.md; returns its path in the repository."""
+def table_text(conn: sqlite3.Connection, name: str) -> str:
+    """Render questions or saved queries without writing to the export."""
     if name == "questions":
         rows = [list(r) for r in conn.execute(
             "SELECT id, question, about, asked, asked_by, answer, answered FROM questions ORDER BY id")]
@@ -124,7 +146,12 @@ def export_table(conn: sqlite3.Connection, name: str) -> str:
         text = "# Queries\n\nSaved queries, rows of the `queries` table. Run one with `sql`.\n" + "".join(
             f"\n## {r['name']}\n\n{r['about'] or ''}\n\n```sql\n{r['sql'].strip()}\n```\n"
             for r in conn.execute("SELECT * FROM queries ORDER BY name"))
-    (config.VAULT_ROOT / f"{name}.md").write_text(text, "utf-8")
+    return text
+
+
+def export_table(conn: sqlite3.Connection, name: str) -> str:
+    """Write questions.md or queries.md; returns its path in the repository."""
+    _write_text(config.VAULT_ROOT / f"{name}.md", table_text(conn, name))
     return f"{name}.md"
 
 
@@ -145,40 +172,39 @@ def import_all(conn: sqlite3.Connection, root: Path) -> int:
     """Load an export into an empty database (disaster recovery). Returns the number of pages."""
     if conn.execute("SELECT 1 FROM pages LIMIT 1").fetchone():
         raise SystemExit("the database already has pages; import only into an empty one")
-    files = page_files(root)
-    conn.execute("BEGIN IMMEDIATE")
-    parsed = {pid: parse(f.read_text("utf-8")) for pid, f in files.items()}
-    for pid, p in parsed.items():
-        conn.execute("INSERT INTO pages (id, title, body, private) VALUES (?, ?, ?, ?)",
-                     (pid, p["title"] or pid, p["body"], int(p["private"])))
-        if p["file"]:
-            f = p["file"]
-            conn.execute("INSERT INTO files VALUES (?, ?, ?, ?, ?, ?, ?)", (
-                pid, f["blob"], f["sha256"], f.get("mime"), f.get("size"), f.get("name"),
-                json.dumps(f.get("versions") or [])))
-    for pid, p in parsed.items():
-        conn.executemany("INSERT INTO facts VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
-                         [(row[0], pid, *row[1:]) for row in p["facts"]])
-    q = root / "questions.md"
-    if q.is_file():
-        conn.executemany("INSERT INTO questions VALUES (?, ?, ?, ?, ?, ?, ?)",
-                         read_table(q.read_text("utf-8"), QUESTION_COLUMNS))
-    q = root / "queries.md"
-    if q.is_file():
-        for name, about, sql in re.findall(r"^## ([^\n]+)\n\n(.*?)\n\n```sql\n(.*?)\n```", q.read_text("utf-8"),
-                                           re.M | re.S):
-            conn.execute("INSERT INTO queries VALUES (?, ?, ?)", (name.strip(), sql, about.strip() or None))
-    conn.execute("COMMIT")
+    parsed = {pid: parse(f.read_text("utf-8")) for pid, f in page_files(root).items()}
+    with conn:
+        conn.execute("BEGIN IMMEDIATE")
+        for pid, p in parsed.items():
+            conn.execute("INSERT INTO pages (id, title, body, private) VALUES (?, ?, ?, ?)",
+                         (pid, p["title"] or pid, p["body"], int(p["private"])))
+            if p["file"]:
+                f = p["file"]
+                conn.execute("INSERT INTO files VALUES (?, ?, ?, ?, ?, ?, ?)", (
+                    pid, f["blob"], f["sha256"], f.get("mime"), f.get("size"), f.get("name"),
+                    json.dumps(f.get("versions") or [])))
+        for pid, p in parsed.items():
+            conn.executemany("INSERT INTO facts VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                             [(row[0], pid, *row[1:]) for row in p["facts"]])
+        q = root / "questions.md"
+        if q.is_file():
+            conn.executemany("INSERT INTO questions VALUES (?, ?, ?, ?, ?, ?, ?)",
+                             read_table(q.read_text("utf-8"), QUESTION_COLUMNS))
+        q = root / "queries.md"
+        if q.is_file():
+            for name, about, sql in re.findall(r"^## ([^\n]+)\n\n(.*?)\n\n```sql\n(.*?)\n```", q.read_text("utf-8"),
+                                               re.M | re.S):
+                conn.execute("INSERT INTO queries VALUES (?, ?, ?)", (name.strip(), sql, about.strip() or None))
     return len(parsed)
 
 
 def main() -> None:
-    from . import store
+    from . import repo, store
     ap = argparse.ArgumentParser(description="Rebuild the database from the Markdown export (vault-import), "
                                              "or write the whole export again (vault-import --export).")
     ap.add_argument("--export", action="store_true", help="re-derive and re-export every page instead")
     args = ap.parse_args()
-    with store.connect() as conn:
+    with repo.locked(), store.connect() as conn:
         if not args.export:
             print(f"imported {import_all(conn, config.VAULT_ROOT)} pages from {config.VAULT_ROOT}")
         store.derive_all(conn)

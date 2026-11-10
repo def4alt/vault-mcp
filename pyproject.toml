@@ -1,6 +1,6 @@
 [project]
 name = "vault-mcp"
-version = "1.2.0"
+version = "1.2.1"
 description = "MCP server for a SQLite-first personal knowledge vault"
 readme = "README.md"
 authors = [
@@ -23,11 +23,12 @@ vault-worker = "vault_mcp.worker:main"
 vault-import = "vault_mcp.markdown:main"
 
 [build-system]
-requires = ["uv_build>=0.11.18,<0.12.0"]
+requires = ["uv_build>=0.13.7,<0.14.0"]
 build-backend = "uv_build"
 
 [dependency-groups]
 dev = [
+    "httpx2>=2.13.1",
     "pytest>=9.1.1",
     "pytest-asyncio>=1.4.0",
 ]

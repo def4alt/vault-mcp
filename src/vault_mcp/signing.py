@@ -47,7 +47,7 @@ def _sign(path: str, ttl: int | None) -> tuple[str, int]:
     scope = scope_of(path)
     if scope is None:
         raise DocumentError(f"`{path}` cannot be linked")
-    expires = int(time.time()) + (ttl or config.LINK_TTL)
+    expires = int(time.time()) + (config.LINK_TTL if ttl is None else ttl)
     query = urllib.parse.urlencode({"e": expires, "s": _mac(scope, expires)})
     return f"{config.PUBLIC_URL}{urllib.parse.quote(path)}?{query}", expires
 
@@ -61,7 +61,7 @@ def verify(raw_uri: str) -> int:
         expires, signature = int(query["e"][0]), query["s"][0]
     except (KeyError, ValueError):
         return 403
-    if scope is None or not hmac.compare_digest(signature, _mac(scope, expires)):
+    if scope is None or not hmac.compare_digest(signature.encode(), _mac(scope, expires).encode()):
         return 403
     return 410 if expires < time.time() else 200
 

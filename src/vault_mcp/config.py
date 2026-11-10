@@ -20,7 +20,7 @@ def _pairs(text: str) -> dict[str, str]:
 # holds text extracts and the embedding model.
 VAULT_ROOT = Path(env("VAULT_ROOT", "/vault"))
 DOCS_ROOT = Path(env("DOCS_ROOT", "/documents"))
-CACHE_ROOT = Path(env("CACHE_ROOT", "/cache"))  # text extracts + SQLite index
+CACHE_ROOT = Path(env("CACHE_ROOT", "/cache"))  # document text extracts and the embedding model
 DROP_REL = env("DROP_REL", "Agent/inbox")  # drop folder inside the documents tree
 
 
@@ -41,10 +41,6 @@ EMBED_QUERY_PREFIX = env("EMBED_QUERY_PREFIX", "Instruct: Given a web search que
                                                "that answer the query\nQuery: ")
 EMBED_MAX_TOKENS = int(env("EMBED_MAX_TOKENS", "512"))
 EMBED_THREADS = int(env("EMBED_THREADS", "4"))
-
-
-def db_path() -> Path:
-    return DB_PATH
 
 
 # Public URL of this server: MCP at /mcp, OAuth, file links (/f, /d) and uploads (/u).

@@ -83,6 +83,7 @@ def write(statements: list[Statement], message: str, ctx: Context, idempotency_k
     INSERT INTO questions (question, about, asked_by) VALUES ('Does X still hold?', 'notes/acme', 'claude')
     DELETE FROM pages WHERE id = 'notes/acme'                         -- its facts go with it; git keeps history
     DELETE FROM blobs WHERE name = '0123456789abcdef.pdf'             -- remove an unused stored file, for good
+    No SELECT or RETURNING here; write returns row counts, not result sets. Use sql for reads.
     Constraints explain themselves when violated. A statement changing more than 20 rows needs many=true.
     message: what and why, e.g. "ingest: SNU timetable". Conventions: fetch("AGENTS")."""
     if not statements:
@@ -127,6 +128,8 @@ def fetch(id: str, offset: int = 0) -> Document:
     commit from `log.sha`). File pages return their description and download_url, never the blob body;
     HTML file pages also have a view_url. Direct HTML documents return only a link and metadata.
     Fact refs fetch their parent page. Long texts continue at metadata.next_offset."""
+    if offset < 0:
+        raise ToolError("offset must be non-negative")
     item_id = id.strip().lstrip("/")
     if item_id.startswith("doc:"):
         p = documents.resolve(item_id.removeprefix("doc:"))
@@ -134,7 +137,7 @@ def fetch(id: str, offset: int = 0) -> Document:
             raise ToolError(f"no document `{item_id}`; closest: {_closest(item_id)}")
         text = "HTML attachment; open the URL to view it. Its body is not indexed or returned." \
             if p.suffix.lower() in documents.HTML else \
-            documents.cached_text(documents.sha256_of(p)) or documents.extract_text(p) or \
+            documents.text_for(p, documents.sha256_of(p)) or \
             f"({documents.media_of(p)} without extractable text; open it with the url)"
         body, more = _page(text, offset)
         return Document(id=item_id, title=p.name, text=body, url=_url(item_id),
@@ -149,8 +152,7 @@ def fetch(id: str, offset: int = 0) -> Document:
     item_id = item_id.split("#", 1)[0].removesuffix(".md")  # a fact hit (notes/x#fact-3) reads its page
     with store.connect() as conn:
         if item_id in ("questions", "queries"):
-            markdown.export_table(conn, item_id)
-            body, more = _page((config.VAULT_ROOT / f"{item_id}.md").read_text("utf-8"), offset)
+            body, more = _page(markdown.table_text(conn, item_id), offset)
             return Document(id=item_id, title=item_id.title(), text=body, url=_url(item_id), metadata=more)
         row = conn.execute("SELECT title, private, updated FROM pages WHERE id = ?", (item_id,)).fetchone()
         if row is None:
@@ -195,13 +197,15 @@ async def upload(ctx: Context, purpose: str = "", tags: list[str] | None = None,
         with store.connect() as conn:
             if not conn.execute("SELECT 1 FROM files WHERE id = ?", (replaces,)).fetchone():
                 raise ToolError(f"`{replaces}` is not a file page; replaces takes files/<name>")
-    await anyio.to_thread.run_sync(incoming.check_quota)
     if file is not None or url:
         source = file.download_url if file is not None else url
         part, name = await anyio.to_thread.run_sync(incoming.fetch, source, file.file_name if file else None)
-        result = await anyio.to_thread.run_sync(partial(
-            filing.file, part, original_name=name, origin=filing.origin_of(who) if file else "web",
-            added_by=who, purpose=purpose, url=None if file else url, tags=tags, replaces=replaces))
+        try:
+            result = await anyio.to_thread.run_sync(partial(
+                filing.file, part, original_name=name, origin=filing.origin_of(who) if file else "web",
+                added_by=who, purpose=purpose, url=None if file else url, tags=tags, replaces=replaces))
+        finally:
+            part.unlink(missing_ok=True)
         return UploadResult(note=result["note"], duplicate=result["duplicate"], view_url=pages.view_url(result["note"]))
     ticket = incoming.open_ticket(who, purpose, tags, replaces)
     template, expires = signing.upload_link(ticket)

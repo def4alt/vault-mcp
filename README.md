@@ -14,7 +14,7 @@ vault/                     the Markdown export, a git repo: one file per page, w
   blobs/<sha256[:16]>.<ext>   the stored files, named by content, never renamed (gitignored, backed up)
   .incoming/                  upload tickets and partial uploads (same mount, so filing is a rename)
 documents/                 Andrii's own folders, read-only; Agent/inbox/ is a drop folder
-cache/                     text/<sha256>.txt extracts and the embedding model
+cache/                     text/<sha256[:2]>/<sha256>.txt document extracts and the embedding model
 ```
 
 The export is for people and for git: it gives every change a diff and a history, and `vault-import`
@@ -35,10 +35,12 @@ read-only pragmas), a time limit, row paging and clipped cells. `write` runs und
 row changes on the four tables and nothing else, and refuses a statement that changes more than 20 rows
 unless it says `many`. Lint findings and review queues are views and saved queries (`problems`,
 `queries`). Resources: `vault://AGENTS` (the AGENTS page), `vault://schema` (the DDL).
+The row guard also covers CTE-prefixed writes. `write` rejects SELECT and RETURNING; use `sql` for reads.
+File metadata changes through upload or page cascades, not direct UPDATE/DELETE on `files`.
 
 ## Design
 
-- **Three things are stored, the rest is inferred.** A page is id, title, body, private. A fact is a claim
+- **A small canonical model, the rest is inferred.** A page is id, title, body, private, updated. A fact is a claim
   about a page with a validity period (`valid_from`, `valid_until`), the date it was confirmed, a source and
   a note. No kinds, statuses, tags, categories or summaries: the table says what a row is, an empty
   `confirmed` says it is unreviewed, search and links say what it is about.
@@ -63,7 +65,11 @@ independently corroborate a claim. Stop when important claims have support and r
 The live vault's `AGENTS` page documents this workflow. Saved SQL recipes `semantic-diverse` (at most two
 distinct references per page), `evidence` (full fact provenance by page or fact ref), `keyword` and
 `open-questions` compose through the existing `sql` tool. They are rows, not new tools or a query planner.
-Default ranking is unchanged. Fact evidence fields are read from `facts`, never inferred from snippets.
+  Default ranking is unchanged. Fact evidence fields are read from `facts`, never inferred from snippets.
+
+Markdown table cells escape pipes and HTML entities, so literal `<br>`, carriage returns and wiki-link
+aliases survive export/import. Exports are replaced atomically; malformed table rows abort recovery
+instead of silently disappearing. SQLite snapshots remain the lossless backup, including timestamps and log.
 
 ## Moving bytes
 

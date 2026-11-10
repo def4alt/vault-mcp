@@ -16,7 +16,7 @@ import shutil
 import unicodedata
 from pathlib import Path
 
-from . import config, documents, repo, store
+from . import config, documents, incoming, repo, store
 
 
 def origin_of(client: str) -> str:
@@ -46,6 +46,7 @@ def store_blob(src: Path, sha: str, name: str) -> str:
     for length in (16, 32, 64):  # a longer name only if a 64-bit prefix ever collides
         dest = root / f"{sha[:length]}{_extension(name)}"
         if not dest.exists():
+            incoming.check_quota(src.stat().st_size)  # actual bytes, under the shared writer lock
             shutil.move(src, dest)  # a rename: incoming files live on the same mount
             os.chmod(dest, 0o664)
             return f"blobs/{dest.name}"

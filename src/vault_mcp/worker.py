@@ -73,7 +73,7 @@ def run_once(cycle: int = 0, last_push: float = 0.0) -> float:
     with store.connect() as conn:
         store.embed_backlog(conn)
         if cycle % SLOW_EVERY == 0:
-            store.sync_documents(conn, extract=True)
+            store.sync_documents(conn)
             kinds = dict(conn.execute("SELECT kind, count(*) FROM problems GROUP BY kind").fetchall())
             for kind in _reported | set(kinds):
                 PROBLEMS.labels(kind).set(kinds.get(kind, 0))

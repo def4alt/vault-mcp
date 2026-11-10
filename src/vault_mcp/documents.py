@@ -138,11 +138,6 @@ def _cache(sha: str) -> Path:
     return config.CACHE_ROOT / "text" / sha[:2] / f"{sha}.txt"
 
 
-def cached_text(sha: str) -> str | None:
-    p = _cache(sha)
-    return (p.read_text("utf-8", "replace") or None) if p.exists() else None
-
-
 def text_for(path: Path, sha: str) -> str | None:
     """Extracted text of a file, cached by content hash (an empty cache file means "no text")."""
     if path.suffix.lower() not in EXTRACTABLE:

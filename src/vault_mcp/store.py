@@ -1,4 +1,4 @@
-"""The vault is one SQLite file. Three tables hold what cannot be inferred; the rest is derived.
+"""The vault is one SQLite file. Six tables hold canonical data; the rest is derived.
 
     pages       id, title, body, private, updated         every page: notes/x, sources/x, projects/x, files/x
     facts       id, subject, claim, valid_from, valid_until, confirmed, source, note
@@ -7,7 +7,7 @@
     queries     name, sql, about                           saved queries: tools as data
     log         time, actor, message, changed, sha         every write, with the git commit of its export
 
-Derived, rebuilt from the above at any time (`vault-derive`): links, chunks (+ embeddings), fts,
+Derived, rebuilt from the above (`vault-import --export`; the worker indexes documents): links, chunks, fts,
 documents, blobs, and the views current_facts and problems.
 
 Agents read with one SELECT (`run_sql`) and change rows with ordinary INSERT/UPDATE/DELETE statements
@@ -194,19 +194,19 @@ def _functions(conn: sqlite3.Connection) -> None:
 
 @contextlib.contextmanager
 def connect() -> Iterator[sqlite3.Connection]:
-    path = config.db_path()
+    path = config.DB_PATH
     path.parent.mkdir(parents=True, exist_ok=True)
     conn = sqlite3.connect(path, timeout=15, isolation_level=None)
-    conn.row_factory = sqlite3.Row
-    conn.execute("PRAGMA journal_mode=WAL")
-    conn.execute("PRAGMA synchronous=NORMAL")
-    conn.execute("PRAGMA foreign_keys=ON")
-    _functions(conn)
     try:
-        conn.execute("SELECT 1 FROM meta LIMIT 1")
-    except sqlite3.OperationalError:
-        _create(conn)
-    try:
+        conn.row_factory = sqlite3.Row
+        conn.execute("PRAGMA journal_mode=WAL")
+        conn.execute("PRAGMA synchronous=NORMAL")
+        conn.execute("PRAGMA foreign_keys=ON")
+        _functions(conn)
+        try:
+            conn.execute("SELECT 1 FROM meta LIMIT 1")
+        except sqlite3.OperationalError:
+            _create(conn)
         version = conn.execute("SELECT value FROM meta WHERE key = 'schema'").fetchone()[0]
         if version != SCHEMA_VERSION:
             raise RuntimeError(f"unsupported database schema {version}; expected {SCHEMA_VERSION}")
@@ -307,7 +307,7 @@ def drain(conn: sqlite3.Connection) -> list[str]:
 
 
 def derive_all(conn: sqlite3.Connection) -> None:
-    """Mark everything touched, e.g. after an import or when the embedding model changes."""
+    """Mark every page and saved table for re-derivation and export."""
     conn.execute("INSERT OR IGNORE INTO touched SELECT id FROM pages")
     conn.execute("INSERT OR IGNORE INTO touched VALUES ('questions'), ('queries')")
 
@@ -328,7 +328,7 @@ def sync_blobs(conn: sqlite3.Connection) -> None:
     conn.execute("COMMIT")
 
 
-def sync_documents(conn: sqlite3.Connection, extract: bool = True) -> int:
+def sync_documents(conn: sqlite3.Connection) -> int:
     """Index the documents tree (read-only material): rows, chunks and embeddings."""
     drop = config.DOCS_ROOT / config.DROP_REL
     entries: dict[str, tuple[float, int]] = {}
@@ -344,7 +344,7 @@ def sync_documents(conn: sqlite3.Connection, extract: bool = True) -> int:
     for item_id in changed:
         p, rel = files[item_id], item_id.removeprefix("doc:")
         sha = documents.sha256_of(p)
-        text = documents.text_for(p, sha) if extract else documents.cached_text(sha)
+        text = documents.text_for(p, sha)
         conn.execute("BEGIN IMMEDIATE")
         conn.execute("INSERT OR REPLACE INTO documents VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)", (
             item_id, rel, rel.split("/")[0], p.name, documents.media_of(p), documents.mime_of(p),
@@ -392,18 +392,26 @@ def embed_backlog(conn: sqlite3.Connection, seconds: float = 20.0) -> int:
 
 # --- writing ---------------------------------------------------------------------------
 
-def _write_auth(action: int, arg1, arg2, db, source) -> int:
-    if action in (sqlite3.SQLITE_SELECT, sqlite3.SQLITE_READ, sqlite3.SQLITE_FUNCTION,
-                  getattr(sqlite3, "SQLITE_RECURSIVE", 33)):
-        return sqlite3.SQLITE_OK
-    if action in (sqlite3.SQLITE_INSERT, sqlite3.SQLITE_UPDATE, sqlite3.SQLITE_DELETE):
-        if source is not None:  # a trigger doing the bookkeeping
+def _write_auth():
+    """One authorizer per statement: file metadata changes only through a page's FK cascade."""
+    target = None
+
+    def authorize(action: int, arg1, arg2, db, source) -> int:
+        nonlocal target
+        if action in _READ:
             return sqlite3.SQLITE_OK
-        if arg1 in WRITABLE and (arg1 != "blobs" or action == sqlite3.SQLITE_DELETE):
-            return sqlite3.SQLITE_OK
-        if arg1 == "files" and action != sqlite3.SQLITE_INSERT:  # renames and deletes of its page cascade here
-            return sqlite3.SQLITE_OK
-    return sqlite3.SQLITE_DENY
+        if action in (sqlite3.SQLITE_INSERT, sqlite3.SQLITE_UPDATE, sqlite3.SQLITE_DELETE):
+            if source is not None:  # a trigger doing the bookkeeping
+                return sqlite3.SQLITE_OK
+            if target is None:
+                target = arg1
+            if arg1 in WRITABLE and (arg1 != "blobs" or action == sqlite3.SQLITE_DELETE):
+                return sqlite3.SQLITE_OK
+            if arg1 == "files" and target == "pages" and action != sqlite3.SQLITE_INSERT:
+                return sqlite3.SQLITE_OK
+        return sqlite3.SQLITE_DENY
+
+    return authorize
 
 
 def _friendly(e: Exception) -> str:
@@ -425,14 +433,18 @@ def apply(statements: list[tuple[str, list | dict | None, bool]], actor: str, me
             return {"commit": done["sha"], "changed": json.loads(done["changed"]), "rows": 0, "replayed": True}
         rows = 0
         conn.execute("BEGIN IMMEDIATE")
-        conn.set_authorizer(_write_auth)
         try:
             for sql, params, many in statements:
+                conn.set_authorizer(_write_auth())
                 cur = conn.execute(sql, params or [])
-                if cur.rowcount > MANY and not many:
-                    raise ValueError(f"this statement would change {cur.rowcount} rows; narrow its WHERE, or pass "
-                                     f"many=true if that is what you mean: {sql[:80]}")
-                rows += max(cur.rowcount, 0)
+                if cur.description is not None:
+                    cur.close()
+                    raise ValueError("write takes INSERT, UPDATE and DELETE without RETURNING; use sql to read")
+                changed_rows = conn.execute("SELECT changes()").fetchone()[0]
+                if changed_rows > MANY and not many:
+                    raise ValueError(f"this statement would change {changed_rows} rows; narrow its WHERE, or pass "
+                                      f"many=true if that is what you mean: {sql[:80]}")
+                rows += changed_rows
         except (sqlite3.Error, ValueError) as e:
             conn.set_authorizer(None)
             conn.execute("ROLLBACK")
@@ -463,7 +475,10 @@ def decode_cursor(cursor: str | None) -> int:
     if not cursor:
         return 0
     try:
-        return int(json.loads(base64.urlsafe_b64decode(cursor.encode()))["o"])
+        offset = json.loads(base64.urlsafe_b64decode(cursor.encode()))["o"]
+        if type(offset) is not int or offset < 0:
+            raise ValueError
+        return offset
     except (ValueError, KeyError, TypeError):
         raise ValueError("invalid cursor; start again without one") from None
 
@@ -501,16 +516,21 @@ def search(conn: sqlite3.Connection, query: str, limit: int, offset: int = 0) ->
     for ranking in (keyword, meaning):
         for rank, chunk in enumerate(ranking):
             score[chunk] = score.get(chunk, 0.0) + 1.0 / (60 + rank)
+    if not score:
+        return [], False
+    candidates = {r["id"]: r for r in conn.execute(
+        "SELECT c.id,c.ref,c.title,c.text,f.valid_from,f.valid_until,f.confirmed,f.source,f.note "
+        "FROM json_each(?) ids JOIN chunks c ON c.id=ids.value "
+        "LEFT JOIN facts f ON f.subject=c.page AND c.ref=f.subject || '#fact-' || f.id",
+        (json.dumps(list(score)),))}
     best: dict[str, dict] = {}
     for chunk in sorted(score, key=score.get, reverse=True):
-        row = conn.execute("SELECT ref, title, text FROM chunks WHERE id = ?", (chunk,)).fetchone()
+        row = candidates.get(chunk)
         if row and row["ref"] not in best:
-            owner, marker, number = row["ref"].rpartition("#fact-")
-            fact = conn.execute("SELECT valid_from, valid_until, confirmed, source, note FROM facts "
-                                "WHERE id = ? AND subject = ?", (int(number), owner)).fetchone() \
-                if marker and number.isdecimal() else None
+            fact = {k: row[k] for k in ("valid_from", "valid_until", "confirmed", "source", "note")} \
+                if row["valid_from"] is not None else None
             best[row["ref"]] = {"id": row["ref"], "title": row["title"], "text": row["text"],
-                                "fact": dict(fact) if fact else None}
+                                "fact": fact}
     found = list(best.values())
     return found[offset:offset + limit], len(found) > offset + limit
 
@@ -526,7 +546,7 @@ def suggest(conn: sqlite3.Connection, wanted: str, limit: int = 3) -> list[str]:
     return [r[0] for r in rows]
 
 
-_READ = {sqlite3.SQLITE_SELECT, sqlite3.SQLITE_READ, sqlite3.SQLITE_FUNCTION, getattr(sqlite3, "SQLITE_RECURSIVE", 33)}
+_READ = {sqlite3.SQLITE_SELECT, sqlite3.SQLITE_READ, sqlite3.SQLITE_FUNCTION, sqlite3.SQLITE_RECURSIVE}
 _PRAGMAS = {"table_info", "table_xinfo", "index_list", "index_info", "data_version"}  # FTS5 reads data_version
 CELL_MAX = 2000
 RESULT_MAX = 100_000  # characters across all returned cells
@@ -550,7 +570,7 @@ def run_sql(sql: str, params: list | dict | None, limit: int, offset: int) -> tu
     """(columns, rows as dicts, more rows exist). Raises ValueError with a message meant for the agent."""
     with connect():  # make sure the database exists
         pass
-    conn = sqlite3.connect(f"file:{config.db_path()}?mode=ro", uri=True, timeout=5, isolation_level=None)
+    conn = sqlite3.connect(config.DB_PATH.resolve().as_uri() + "?mode=ro", uri=True, timeout=5, isolation_level=None)
     try:
         conn.execute("PRAGMA query_only = 1")
         _functions(conn)

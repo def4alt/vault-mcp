@@ -20,9 +20,12 @@ NAME = re.compile(r"[a-z0-9][a-z0-9-]{0,79}")
 TITLE = re.compile(rb"<title[^>]*>(.*?)</title>", re.I | re.S)
 
 
-def url(note: str) -> str | None:
+def url(note: str | None) -> str | None:
     """Where a person views files/<name>, or None when pages are off."""
-    return f"{config.PAGES_URL}/{note.removeprefix('files/')}/" if config.PAGES_URL and note else None
+    if not config.PAGES_URL or not note or not note.startswith("files/"):
+        return None
+    name = note.removeprefix("files/")
+    return f"{config.PAGES_URL}/{name}/" if NAME.fullmatch(name) else None
 
 
 def _html_files() -> list:
@@ -34,7 +37,8 @@ def _html_files() -> list:
 
 def view_url(note: str) -> str | None:
     """The page URL of a file page, or None if it is not an HTML page or pages are off."""
-    return url(note) if any(r["id"] == note for r in _html_files()) else None
+    view = url(note)
+    return view if view and any(r["id"] == note for r in _html_files()) else None
 
 
 def blob_for(request_path: str) -> str | None:
@@ -45,7 +49,11 @@ def blob_for(request_path: str) -> str | None:
     row = next((r for r in _html_files() if r["id"] == f"files/{parts[0]}"), None)
     if row is None:
         return None
-    blob = row["blob"].removeprefix("blobs/")
+    return _blob_name(row["blob"])
+
+
+def _blob_name(path: str) -> str | None:
+    blob = path.removeprefix("blobs/")
     return blob if BLOB.fullmatch(blob) and (config.blobs_root() / blob).is_file() else None
 
 
@@ -60,7 +68,7 @@ def listing() -> list[dict]:
     out = []
     for r in _html_files():
         name = r["id"].removeprefix("files/")
-        if (blob := blob_for(f"/{name}/")) is None:
+        if not NAME.fullmatch(name) or (blob := _blob_name(r["blob"])) is None:
             continue
         out.append({"name": name, "title": _title(blob) or name, "summary": r["body"].strip().split("\n", 1)[0],
                     "as_of": r["updated"][:10]})

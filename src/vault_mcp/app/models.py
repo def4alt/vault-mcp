@@ -50,7 +50,7 @@ class SqlResult(BaseModel):
 
 
 class Statement(BaseModel):
-    sql: str = Field(description="One INSERT, UPDATE or DELETE on pages, facts, questions or queries")
+    sql: str = Field(description="One INSERT, UPDATE or DELETE without RETURNING on pages, facts, questions or queries")
     params: list[Any] | dict[str, Any] | None = Field(None, description="Values for ? or :name placeholders")
     many: bool = Field(False, description="Set when the statement is meant to change more than 20 rows")
 

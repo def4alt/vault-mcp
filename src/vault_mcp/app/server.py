@@ -75,7 +75,6 @@ async def put_file(request: Request) -> Response:
     if length > config.UPLOAD_MAX_BYTES:
         return PlainTextResponse(f"larger than {config.UPLOAD_MAX_BYTES // 1024**2} MB\n", status_code=413)
     try:
-        await anyio.to_thread.run_sync(incoming.check_quota, length)
         part = await incoming.receive(request.stream(), config.UPLOAD_MAX_BYTES)
     except documents.DocumentError as e:
         return PlainTextResponse(f"{e}\n", status_code=413)
@@ -86,6 +85,8 @@ async def put_file(request: Request) -> Response:
             added_by=ticket["client"], purpose=ticket["purpose"], tags=ticket["tags"], replaces=ticket.get("replaces")))
     except documents.DocumentError as e:
         return PlainTextResponse(f"{e}\n", status_code=409)
+    finally:
+        part.unlink(missing_ok=True)
     answer = {"note": result["note"], "duplicate": result["duplicate"]}
     if view := pages.view_url(result["note"]):
         answer["view_url"] = view
