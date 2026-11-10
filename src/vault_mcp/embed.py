@@ -14,7 +14,6 @@ import functools
 import logging
 import re
 import zlib
-from pathlib import Path
 
 import numpy as np
 
@@ -30,9 +29,10 @@ def _model(repo: str, file: str):
     import onnxruntime as ort  # imported late: the hash fallback needs none of it
     from huggingface_hub import snapshot_download
     from tokenizers import Tokenizer
-    root = Path(snapshot_download(  # real files, not cache symlinks: onnxruntime wants the weights beside the graph
-        repo, allow_patterns=[file, f"{file}_data*", "tokenizer.json"],
-        local_dir=str(config.CACHE_ROOT / "models" / repo.replace("/", "--"))))
+    root = config.CACHE_ROOT / "models" / repo.replace("/", "--")
+    if not ((root / file).is_file() and (root / "tokenizer.json").is_file()):  # downloaded once, then offline
+        snapshot_download(  # real files, not cache symlinks: onnxruntime wants the weights beside the graph
+            repo, allow_patterns=[file, f"{file}_data*", "tokenizer.json"], local_dir=str(root))
     tokenizer = Tokenizer.from_file(str(root / "tokenizer.json"))
     tokenizer.enable_truncation(max_length=config.EMBED_MAX_TOKENS)
     tokenizer.no_padding()
@@ -82,7 +82,7 @@ def passage(title: str | None, text: str) -> bytes:
 
 @functools.lru_cache(maxsize=256)
 def _query(model: str, text: str) -> bytes:
-    return _encode((config.EMBED_QUERY_PREFIX if model else "") + text)
+    return _encode((config.EMBED_QUERY_PREFIX if config.EMBED_MODEL else "") + text)
 
 
 def query(text: str | None) -> bytes | None:

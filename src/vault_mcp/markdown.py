@@ -165,7 +165,7 @@ def import_all(conn: sqlite3.Connection, root: Path) -> int:
                          read_table(q.read_text("utf-8"), QUESTION_COLUMNS))
     q = root / "queries.md"
     if q.is_file():
-        for name, about, sql in re.findall(r"^## (.+)\n\n(.*?)\n\n```sql\n(.*?)\n```", q.read_text("utf-8"),
+        for name, about, sql in re.findall(r"^## ([^\n]+)\n\n(.*?)\n\n```sql\n(.*?)\n```", q.read_text("utf-8"),
                                            re.M | re.S):
             conn.execute("INSERT INTO queries VALUES (?, ?, ?)", (name.strip(), sql, about.strip() or None))
     conn.execute("COMMIT")

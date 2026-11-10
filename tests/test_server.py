@@ -132,6 +132,27 @@ async def test_a_retried_write_is_applied_once(env):
     assert len(await rows("SELECT id FROM pages")) == 1
 
 
+async def test_current_facts_respect_both_ends_of_the_validity_period(env):
+    await write(ACME,
+                "INSERT INTO facts (subject, claim, valid_from) VALUES ('notes/acme', 'Ongoing', '2000-01-01')",
+                "INSERT INTO facts (subject, claim, valid_from, valid_until) VALUES "
+                "('notes/acme', 'Today', date('now'), date('now'))",
+                "INSERT INTO facts (subject, claim, valid_from, valid_until) VALUES "
+                "('notes/acme', 'Past', '2000-01-01', date('now', '-1 day'))",
+                "INSERT INTO facts (subject, claim, valid_from) VALUES "
+                "('notes/acme', 'Future', date('now', '+1 day'))")
+    assert await rows("SELECT claim FROM current_facts ORDER BY id") == [{"claim": "Ongoing"}, {"claim": "Today"}]
+    assert await rows("SELECT count(*) AS n FROM facts") == [{"n": 4}]
+    # Rehearse an existing v1 database opening under the new code, not only a fresh schema.
+    with store.connect() as conn:
+        conn.execute("DROP VIEW current_facts")
+        conn.execute("CREATE VIEW current_facts AS SELECT * FROM facts WHERE "
+                     "valid_until IS NULL OR valid_until >= date('now')")
+        conn.execute("UPDATE meta SET value = '1' WHERE key = 'schema'")
+    assert await rows("SELECT claim FROM current_facts ORDER BY id") == [{"claim": "Ongoing"}, {"claim": "Today"}]
+    assert await rows("SELECT count(*) AS n FROM facts") == [{"n": 4}]
+
+
 async def test_renames_and_deletes_follow_through_and_git_keeps_the_past(env):
     root, _ = env
     first = await write(ACME, JOB, ("INSERT INTO pages (id, title, body) VALUES ('notes/me', 'Me', "
@@ -159,7 +180,7 @@ async def test_search_ranks_by_keywords_and_meaning_and_a_fact_is_a_hit_of_its_o
                             "'Hiking trips in the mountains near Garmisch.')", None))
     top = (await wire("search", query="where do I work"))["results"][0]
     assert set(top) == {"id", "title", "text", "url"} and top["id"] == "notes/acme#fact-1"
-    assert "I work at Acme." in top["text"] and "still true" in top["text"] and top["title"] == "Acme"
+    assert "I work at Acme." in top["text"] and "open-ended" in top["text"] and top["title"] == "Acme"
     assert top["url"] == "https://notes.example/notes/acme"
     assert (await call("search", query="mountains hiking")).results[0].id == "notes/alps"
     page = await call("fetch", id=top["id"])
@@ -172,6 +193,35 @@ async def test_search_ranks_by_keywords_and_meaning_and_a_fact_is_a_hit_of_its_o
     assert by_words == [{"ref": "notes/alps"}]
     with pytest.raises(ToolError, match="closest: notes/acme"):
         await call("fetch", id="notes/acme-inc")
+
+
+async def test_keyword_search_survives_an_unavailable_embedding_model(env, monkeypatch):
+    await write(ACME)
+
+    def unavailable(_):
+        raise OSError("model unavailable")
+
+    monkeypatch.setattr(store.embed, "query", unavailable)
+    assert (await call("search", query="Munich")).results[0].id == "notes/acme"
+
+
+async def test_background_vectors_cannot_be_attached_to_concurrently_changed_text(env, monkeypatch):
+    await write(ACME)
+    with store.connect() as conn:
+        conn.execute("UPDATE chunks SET embedding = NULL")
+        real_passage = store.embed.passage
+        clock = [0]
+
+        def concurrent_edit(title, text):
+            conn.execute("UPDATE chunks SET text = 'New text' WHERE page = 'notes/acme'")
+            clock[0] = 2
+            return real_passage(title, text)
+
+        with monkeypatch.context() as patch:
+            patch.setattr(store.embed, "passage", concurrent_edit)
+            patch.setattr(store.time, "monotonic", lambda: clock[0])
+            store.embed_backlog(conn, seconds=1)
+        assert conn.execute("SELECT embedding FROM chunks").fetchone()[0] is None
 
 
 async def test_problems_and_the_question_queue_are_queries(env):
@@ -198,7 +248,9 @@ async def test_the_export_is_a_way_back(env, tmp_path, monkeypatch):
     root, _ = env
     await write(ACME, JOB, "UPDATE pages SET private = 1 WHERE id = 'notes/acme'",
                 ("INSERT INTO questions (question, asked_by) VALUES ('Why?', 'me')", None),
-                ("INSERT INTO queries VALUES ('all', 'SELECT id FROM pages', 'Every page')", None))
+                ("INSERT INTO queries VALUES ('all', 'SELECT id FROM pages', 'Every page')", None),
+                ("INSERT INTO queries VALUES ('facts', 'SELECT claim FROM facts', NULL)", None),
+                ("INSERT INTO queries VALUES ('questions', 'SELECT question FROM questions', 'Open questions')", None))
     before = {t: await rows(f"SELECT * FROM {t} ORDER BY 1") for t in ("facts", "questions", "queries")}
     page = await rows("SELECT id, title, body, private FROM pages")
     monkeypatch.setattr(config, "DB_PATH", tmp_path / "db/rebuilt.db")

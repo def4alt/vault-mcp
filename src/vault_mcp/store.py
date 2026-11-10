@@ -19,6 +19,7 @@ from __future__ import annotations
 import base64
 import contextlib
 import json
+import logging
 import re
 import sqlite3
 import time
@@ -27,7 +28,8 @@ from pathlib import Path
 
 from . import config, documents, embed, markdown, pages, repo, signing
 
-SCHEMA_VERSION = "1"
+log = logging.getLogger("vault-store")
+SCHEMA_VERSION = "2"
 DATE = "GLOB '[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]'"
 NOW = "strftime('%Y-%m-%dT%H:%M:%fZ', 'now')"
 WRITABLE = {"pages", "facts", "questions", "queries", "blobs"}
@@ -95,7 +97,7 @@ CREATE INDEX chunks_page ON chunks(page);
 CREATE INDEX files_sha ON files(sha256);
 
 CREATE VIEW current_facts AS
-  SELECT * FROM facts WHERE valid_until IS NULL OR valid_until >= date('now');
+  SELECT * FROM facts WHERE valid_from <= date('now') AND (valid_until IS NULL OR valid_until >= date('now'));
 CREATE VIEW problems AS
   SELECT 'broken-link' AS kind, src AS id, 'links to ' || dst || ', which does not exist' AS detail FROM links
    WHERE dst NOT LIKE 'doc:%' AND dst NOT LIKE 'blobs/%' AND NOT EXISTS (SELECT 1 FROM pages WHERE id = dst)
@@ -205,6 +207,7 @@ def connect() -> Iterator[sqlite3.Connection]:
     except sqlite3.OperationalError:
         _create(conn)
     try:
+        _migrate(conn)
         yield conn
     finally:
         conn.close()
@@ -219,6 +222,27 @@ def _create(conn: sqlite3.Connection) -> None:
             conn.execute("ROLLBACK")
         if "already exists" not in str(e):
             raise
+
+
+def _migrate(conn: sqlite3.Connection) -> None:
+    """Upgrade the canonical database in place, keeping every row and its derived vectors."""
+    if conn.execute("SELECT value FROM meta WHERE key = 'schema'").fetchone()[0] == SCHEMA_VERSION:
+        return
+    conn.execute("BEGIN IMMEDIATE")
+    try:
+        version = conn.execute("SELECT value FROM meta WHERE key = 'schema'").fetchone()[0]
+        if version == "1":
+            conn.execute("DROP VIEW current_facts")
+            conn.execute("CREATE VIEW current_facts AS SELECT * FROM facts WHERE valid_from <= date('now') "
+                         "AND (valid_until IS NULL OR valid_until >= date('now'))")
+            conn.execute("UPDATE meta SET value = ? WHERE key = 'schema'", (SCHEMA_VERSION,))
+            conn.execute("INSERT OR IGNORE INTO touched SELECT subject FROM facts")
+        elif version != SCHEMA_VERSION:
+            raise RuntimeError(f"unsupported database schema {version}; expected {SCHEMA_VERSION}")
+        conn.execute("COMMIT")
+    except Exception:
+        conn.execute("ROLLBACK")
+        raise
 
 
 # --- derived data ------------------------------------------------------------------------
@@ -245,12 +269,13 @@ def split(text: str, limit: int = 80) -> list[str]:
 def fact_text(f: sqlite3.Row) -> str:
     state = f"confirmed {f['confirmed']}" if f["confirmed"] else "unreviewed"
     period = f"from {f['valid_from']} until {f['valid_until']}" if f["valid_until"] else \
-        f"from {f['valid_from']}, still true"
+        f"from {f['valid_from']}, open-ended"
     return " ".join(filter(None, [f["claim"], f["note"], f"({state}, {period})"]))
 
 
 def _set_chunks(conn: sqlite3.Connection, page: str, title: str, pieces: list[tuple[str, str]]) -> None:
-    known = dict(conn.execute("SELECT text, embedding FROM chunks WHERE page = ? AND embedding IS NOT NULL", (page,)))
+    known = dict(conn.execute("SELECT text, embedding FROM chunks WHERE page = ? AND title IS ? "
+                              "AND embedding IS NOT NULL", (page, title)))
     conn.execute("DELETE FROM fts WHERE rowid IN (SELECT id FROM chunks WHERE page = ?)", (page,))
     conn.execute("DELETE FROM chunks WHERE page = ?", (page,))
     for ref, text in pieces:
@@ -374,12 +399,15 @@ def embed_backlog(conn: sqlite3.Connection, seconds: float = 20.0) -> int:
     Search works meanwhile: such chunks are found by keyword only."""
     deadline, done = time.monotonic() + seconds, 0
     while time.monotonic() < deadline:
-        rows = conn.execute("SELECT id, title, text FROM chunks WHERE embedding IS NULL LIMIT 8").fetchall()
+        rows = conn.execute("SELECT id, page, title, text FROM chunks WHERE embedding IS NULL "
+                            "ORDER BY (page LIKE 'doc:%'), id LIMIT 8").fetchall()
         if not rows:
             break
-        vectors = [(embed.passage(r["title"], r["text"]), r["id"]) for r in rows]  # computed outside any lock
+        vectors = [(embed.passage(r["title"], r["text"]), r["id"], r["page"], r["title"], r["text"])
+                   for r in rows]  # computed outside any lock; a concurrent write may replace these chunks
         conn.execute("BEGIN IMMEDIATE")
-        conn.executemany("UPDATE chunks SET embedding = ? WHERE id = ? AND embedding IS NULL", vectors)
+        conn.executemany("UPDATE chunks SET embedding = ? WHERE id = ? AND page = ? AND title IS ? "
+                         "AND text = ? AND embedding IS NULL", vectors)
         conn.execute("COMMIT")
         done += len(rows)
     return done
@@ -485,7 +513,12 @@ def search(conn: sqlite3.Connection, query: str, limit: int, offset: int = 0) ->
     pool = max(50, 4 * (limit + offset))
     keyword = [r[0] for r in conn.execute(
         "SELECT rowid FROM fts WHERE fts MATCH ? ORDER BY bm25(fts, 4.0, 1.0) LIMIT ?", (expr, pool))]
-    meaning = embed.nearest(embed.query(query), conn.execute(
+    try:
+        vector = embed.query(query)
+    except Exception:  # no model (first start without network): keywords alone still answer
+        log.exception("embedding the query failed; searching by keyword only")
+        vector = None
+    meaning = embed.nearest(vector, conn.execute(
         "SELECT id, embedding FROM chunks WHERE embedding IS NOT NULL").fetchall(), pool)
     score: dict[int, float] = {}
     for ranking in (keyword, meaning):
