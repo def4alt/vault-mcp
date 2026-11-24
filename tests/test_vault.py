@@ -524,3 +524,11 @@ async def test_blob_links_and_verify(env) -> None:
     assert signing.verify("/f/" + "0" * 16 + "/x?e=1&s=abc") == 403
     expired = signing.blob_link(put["path"], "x.pdf", ttl=-10).removeprefix(config.PUBLIC_URL)
     assert signing.verify(expired) == 410
+
+
+async def test_long_body_round_trips_through_sql_unclipped(env) -> None:
+    body = "## Seen\n\n" + "\n".join(f"- wg-{i:05d}" for i in range(2000))  # ~22 KB, like a long watch list
+    await call("sql", query="INSERT INTO items(id, kind, title, body) VALUES ('watch', 'goal', 'Watch', ?)",
+               params=[body])
+    got = (await call("sql", query="SELECT body FROM items WHERE id = 'watch'"))["rows"][0]["body"]
+    assert got == body

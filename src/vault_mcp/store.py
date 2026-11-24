@@ -14,7 +14,8 @@ from typing import Any
 
 from . import config, documents, embed, signing
 
-CELL_MAX = 2000
+CELL_MAX = 50_000  # above any item body, so a read-modify-write never round-trips a clipped value
+SYNC_BATCH = 32  # vector rows committed per transaction, so a long first sync survives a restart
 RESULT_MAX = 100_000
 ROW_LIMIT_MAX = 100
 
@@ -178,7 +179,7 @@ def _content_digest(parts: tuple[str, ...]) -> bytes:
 
 
 def _sync_vectors_conn(conn: sqlite3.Connection, vec_conn: sqlite3.Connection) -> int:
-    """Delta-sync int8 embeddings in `vec_conn` from `conn` using blake2b content_hash."""
+    """Delta-sync int8 embeddings in `vec_conn` from `conn` using blake2b content_hash, in small batches."""
     model = embed.model_id()
     written = 0
 
@@ -187,77 +188,64 @@ def _sync_vectors_conn(conn: sqlite3.Connection, vec_conn: sqlite3.Connection) -
         for r in vec_conn.execute("SELECT item_id, model, content_hash FROM items_vec").fetchall()
     }
     live_items = conn.execute("SELECT id, kind, title, body FROM items").fetchall()
-    live_item_ids: set[str] = set()
-    dirty_items: list[tuple[str, bytes, bytes]] = []
-
-    for r in live_items:
-        iid = r["id"]
-        live_item_ids.add(iid)
-        digest = _content_digest((r["kind"], r["title"], r["body"]))
-        if existing_items.get(iid) != (model, digest):
-            blob = embed.passage_int8(f"{r['kind']} {r['title']}", r["body"])
-            dirty_items.append((iid, digest, blob))
-
-    stale_items = [iid for iid in existing_items if iid not in live_item_ids]
-
     existing_eps = {
         r["episode_id"]: (r["model"], bytes(r["content_hash"]))
         for r in vec_conn.execute("SELECT episode_id, model, content_hash FROM episodes_vec").fetchall()
     }
     live_eps = conn.execute("SELECT id, source, kind, context, detail FROM episodes").fetchall()
-    live_ep_ids: set[int] = set()
-    dirty_eps: list[tuple[int, bytes, bytes]] = []
 
-    for r in live_eps:
-        eid = int(r["id"])
-        live_ep_ids.add(eid)
-        digest = _content_digest((r["source"], r["kind"], r["context"], r["detail"]))
-        if existing_eps.get(eid) != (model, digest):
-            blob = embed.passage_int8(f"{r['source']} {r['kind']} {r['context']}", r["detail"])
-            dirty_eps.append((eid, digest, blob))
-
-    stale_eps = [eid for eid in existing_eps if eid not in live_ep_ids]
-
-    if stale_items or dirty_items or stale_eps or dirty_eps:
+    def flush(sql: str, rows: list[tuple]) -> None:
+        if not rows:
+            return
         vec_conn.execute("BEGIN")
         try:
-            if stale_items:
-                vec_conn.executemany("DELETE FROM items_vec WHERE item_id = ?", [(i,) for i in stale_items])
-                written += len(stale_items)
-            if dirty_items:
-                vec_conn.executemany(
-                    """
-                    INSERT INTO items_vec(item_id, model, content_hash, embedding)
-                    VALUES (?, ?, ?, ?)
-                    ON CONFLICT(item_id) DO UPDATE SET
-                      model = excluded.model,
-                      content_hash = excluded.content_hash,
-                      embedding = excluded.embedding
-                    """,
-                    [(iid, model, digest, blob) for iid, digest, blob in dirty_items],
-                )
-                written += len(dirty_items)
-            if stale_eps:
-                vec_conn.executemany("DELETE FROM episodes_vec WHERE episode_id = ?", [(e,) for e in stale_eps])
-                written += len(stale_eps)
-            if dirty_eps:
-                vec_conn.executemany(
-                    """
-                    INSERT INTO episodes_vec(episode_id, model, content_hash, embedding)
-                    VALUES (?, ?, ?, ?)
-                    ON CONFLICT(episode_id) DO UPDATE SET
-                      model = excluded.model,
-                      content_hash = excluded.content_hash,
-                      embedding = excluded.embedding
-                    """,
-                    [(eid, model, digest, blob) for eid, digest, blob in dirty_eps],
-                )
-                written += len(dirty_eps)
+            vec_conn.executemany(sql, rows)
             vec_conn.execute("COMMIT")
         except Exception:
             if vec_conn.in_transaction:
                 vec_conn.execute("ROLLBACK")
             raise
+        rows.clear()
+
+    item_sql = """
+        INSERT INTO items_vec(item_id, model, content_hash, embedding) VALUES (?, ?, ?, ?)
+        ON CONFLICT(item_id) DO UPDATE SET
+          model = excluded.model, content_hash = excluded.content_hash, embedding = excluded.embedding
+    """
+    ep_sql = """
+        INSERT INTO episodes_vec(episode_id, model, content_hash, embedding) VALUES (?, ?, ?, ?)
+        ON CONFLICT(episode_id) DO UPDATE SET
+          model = excluded.model, content_hash = excluded.content_hash, embedding = excluded.embedding
+    """
+
+    live_item_ids = {r["id"] for r in live_items}
+    stale_items = [(iid,) for iid in existing_items if iid not in live_item_ids]
+    written += len(stale_items)
+    flush("DELETE FROM items_vec WHERE item_id = ?", stale_items)
+    batch: list[tuple] = []
+    for r in live_items:
+        digest = _content_digest((r["kind"], r["title"], r["body"]))
+        if existing_items.get(r["id"]) != (model, digest):
+            batch.append((r["id"], model, digest, embed.passage_int8(f"{r['kind']} {r['title']}", r["body"])))
+            written += 1
+            if len(batch) >= SYNC_BATCH:
+                flush(item_sql, batch)
+    flush(item_sql, batch)
+
+    live_ep_ids = {int(r["id"]) for r in live_eps}
+    stale_eps = [(eid,) for eid in existing_eps if eid not in live_ep_ids]
+    written += len(stale_eps)
+    flush("DELETE FROM episodes_vec WHERE episode_id = ?", stale_eps)
+    for r in live_eps:
+        eid = int(r["id"])
+        digest = _content_digest((r["source"], r["kind"], r["context"], r["detail"]))
+        if existing_eps.get(eid) != (model, digest):
+            batch.append((eid, model, digest, embed.passage_int8(f"{r['source']} {r['kind']} {r['context']}",
+                                                                r["detail"])))
+            written += 1
+            if len(batch) >= SYNC_BATCH:
+                flush(ep_sql, batch)
+    flush(ep_sql, batch)
     return written
 
 
