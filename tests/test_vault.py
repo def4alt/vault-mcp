@@ -17,7 +17,7 @@ from fastmcp import Client
 from fastmcp.client.transports import StreamableHttpTransport
 from fastmcp.exceptions import ToolError
 
-from vault_mcp import config, documents, embed, files, signing, store
+from vault_mcp import config, documents, embed, files, signing, store, uploads
 from vault_mcp.app.auth import ApiKeys, Gatekeeper, build_auth
 from vault_mcp.app.server import build
 
@@ -253,8 +253,8 @@ def test_tutor_views_and_memory_views_with_cooccurrence_window(env) -> None:
 async def test_path_jail_and_live_view_reload(env) -> None:
     root, _, _ = env
     pdf_bytes = b"%PDF-1.4\nfake-raw-pdf-bytes"
-    first = files.put_blob(root, pdf_bytes, ext="pdf")
-    second = files.put_blob(root, pdf_bytes, ext=".PDF")
+    first = uploads.store_bytes(pdf_bytes, "scan.pdf")
+    second = uploads.store_bytes(pdf_bytes, "SCAN.PDF")
     assert not first["duplicate"] and second["duplicate"]
     assert first["path"] == second["path"]
 
@@ -515,7 +515,7 @@ async def test_documents_index_read_recall_and_signed_links(env, tmp_path: Path,
 
 async def test_blob_links_and_verify(env) -> None:
     root, _, _ = env
-    put = files.put_blob(root, b"%PDF-1.4 fake", ext="pdf")
+    put = uploads.store_bytes(b"%PDF-1.4 fake", "x.pdf")
     res = await call("file", action="read", path=put["path"])
     assert res["binary"] and res["url"].startswith(f"{config.PUBLIC_URL}/f/")
     good = res["url"].removeprefix(config.PUBLIC_URL)
@@ -532,3 +532,43 @@ async def test_long_body_round_trips_through_sql_unclipped(env) -> None:
                params=[body])
     got = (await call("sql", query="SELECT body FROM items WHERE id = 'watch'"))["rows"][0]["body"]
     assert got == body
+
+
+async def test_upload_links_stream_into_blobs(server: str, env, monkeypatch) -> None:
+    root, _, _ = env
+    transport = StreamableHttpTransport(f"{server}/mcp", headers={"Authorization": "Bearer opencode-key"})
+    async with Client(transport) as client:
+        res = await client.call_tool("file", {"action": "upload_link", "name": "Lio contract.pdf"})
+        link = res.structured_content or res.data
+    assert link["curl"].startswith("curl -fsS -T 'Lio contract.pdf' ")
+    target = link["put_url"].replace("{filename}", "Lio%20contract.pdf")
+    body = b"%PDF-1.7 " + b"x" * 300_000
+
+    up = httpx2.put(target, content=body, timeout=10)
+    assert up.status_code == 201, up.text
+    info = up.json()
+    assert info["path"].startswith("blobs/") and info["path"].endswith(".pdf")
+    assert info["size"] == len(body) and info["mime"] == "application/pdf" and info["filename"] == "Lio contract.pdf"
+    assert (root / info["path"]).read_bytes() == body
+    assert signing.verify(info["url"].removeprefix(config.PUBLIC_URL)) == 200
+    assert not list((root / ".incoming").glob("*.part"))
+
+    again = httpx2.put(link["put_url"].replace("{filename}", "copy.pdf"), content=body, timeout=10)
+    assert again.status_code == 200 and again.json()["duplicate"]  # one link, many files; same bytes, same blob
+
+    forged = target.replace("s=", "s=AA")
+    assert httpx2.put(forged, content=b"x", timeout=10).status_code == 403
+    expired, _ = signing.upload_link("ab" * 12, ttl=-5)
+    assert httpx2.put(expired.replace("{filename}", "x.txt"), content=b"x", timeout=10).status_code == 410
+
+    monkeypatch.setattr(config, "UPLOAD_MAX_BYTES", 1000)
+    assert httpx2.put(target, content=b"y" * 5000, timeout=10).status_code == 413
+    monkeypatch.setattr(config, "UPLOAD_MAX_BYTES", 10**9)
+    monkeypatch.setattr(config, "QUOTA_BYTES", 400_000)
+    assert httpx2.put(target, content=b"z" * 200_000, timeout=10).status_code == 413
+
+
+async def test_fetch_refuses_private_addresses(env) -> None:
+    for url in ("http://127.0.0.1:8000/healthz", "http://localhost/x", "file:///etc/passwd", "http://10.0.0.1/a"):
+        with pytest.raises(ToolError):
+            await call("file", action="fetch", url=url)

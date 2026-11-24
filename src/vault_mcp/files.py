@@ -1,7 +1,6 @@
-"""Filesystem gate jailed strictly inside $VAULT_ROOT/ with immutable raw blobs."""
+"""Filesystem gate jailed strictly inside $VAULT_ROOT/; blobs/ is written only by uploads.py."""
 from __future__ import annotations
 
-import hashlib
 from pathlib import Path
 
 DEFAULT_READ_LIMIT = 20_000
@@ -26,30 +25,6 @@ def _require_writable(rel: str) -> None:
         raise ValueError("backups/ is host-managed and read-only over MCP")
     if not rel.startswith(("notes/", "usr/")):
         raise ValueError("direct file writes are allowed only under notes/ and usr/")
-
-
-def put_blob(vault_root: Path, data: bytes, ext: str = "") -> dict[str, object]:
-    """Store raw bytes under blobs/<sha256[:16]><ext> with zero extraction or chunking."""
-    if ext and not ext.startswith("."):
-        ext = "." + ext
-    ext = ext.lower()
-    if any(ch in ext for ch in ("/", "\\", "\x00")):
-        raise ValueError(f"invalid extension: {ext}")
-    digest = hashlib.sha256(data).hexdigest()
-    rel = f"blobs/{digest[:16]}{ext}"
-    target, canonical = resolve_in_vault(vault_root, rel)
-    target.parent.mkdir(parents=True, exist_ok=True)
-    duplicate = target.exists()
-    if not duplicate:
-        tmp = target.with_name(f".{target.name}.tmp")
-        tmp.write_bytes(data)
-        tmp.replace(target)
-    return {
-        "path": canonical,
-        "sha256": digest,
-        "size": len(data),
-        "duplicate": duplicate,
-    }
 
 
 def read_file(vault_root: Path, rel_path: str, offset: int = 0, limit: int = DEFAULT_READ_LIMIT) -> dict[str, object]:

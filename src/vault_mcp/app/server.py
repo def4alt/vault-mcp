@@ -1,7 +1,8 @@
 """Vault MCP server: sql, recall, file and document tools with MultiAuth + Gatekeeper middleware.
 
 HTTP routes besides /mcp and OAuth:
-    /_verify   Caddy's forward_auth check for signed /f (stored files) and /d (documents) downloads
+    /_verify             Caddy's forward_auth check for signed /f (stored files) and /d (documents) downloads
+    /u/<ticket>/<name>   PUT target of a signed upload link, streamed into blobs/
     /healthz
 """
 from __future__ import annotations
@@ -18,9 +19,9 @@ from fastmcp import FastMCP
 from mcp import types as mt
 from prometheus_client import start_http_server
 from starlette.requests import Request
-from starlette.responses import PlainTextResponse, Response
+from starlette.responses import JSONResponse, PlainTextResponse, Response
 
-from .. import config, documents, embed, files, signing, store
+from .. import config, documents, embed, files, signing, store, uploads
 from .auth import Gatekeeper, build_auth
 
 log = logging.getLogger("vault-server")
@@ -45,8 +46,11 @@ INSTRUCTIONS = (
     "1-hop attached neighbors, armed cues, relevant episodes, and matching document passages) within a token budget.\n"
     "- `sql(query, params?, limit=100, cursor?)`: run one parameterized SQL read or write statement; "
     "mutating statements delta-sync vector embeddings automatically.\n"
-    "- `file(action, ...)`: manage files under `$VAULT_ROOT` (`read`, `write`, `put_blob`, `delete`); "
-    "reading a stored blob returns a signed download `url`.\n"
+    "- `file(action, ...)`: files under `$VAULT_ROOT`: `read` (a stored blob returns a signed download `url`), "
+    "`write`/`delete` under notes/ and usr/. Bringing a file in, never as bytes through the model: "
+    "`upload_link` returns a signed PUT URL and a `curl -T` command for agents with a shell; `fetch` makes the "
+    "server download a URL (e.g. a chat attachment's download link); `put_blob` takes small inline base64 only. "
+    "Each returns the blob `path`, `sha256`, `mime`, `filename`; record it on an item's props.\n"
     "- `document(path, offset=0, limit=20000)`: read one of Andrii's documents (e.g. `University/x.pdf`) as "
     "extracted text, with a signed download `url`. List them with `SELECT path FROM vec.documents`.\n\n"
     "Resources: `vault://schema`, `vault://views`.\n"
@@ -101,11 +105,17 @@ async def file(
     path: str = "",
     content: str = "",
     content_base64: str = "",
-    ext: str = "",
+    name: str = "",
+    url: str = "",
     offset: int = 0,
     limit: int = files.DEFAULT_READ_LIMIT,
 ) -> dict[str, Any]:
-    """Operate strictly inside $VAULT_ROOT: action in read | write | put_blob | delete."""
+    """Files under $VAULT_ROOT. action: read | write | delete | upload_link | fetch | put_blob.
+
+    upload_link(name?) returns a signed PUT URL (valid 1 hour, any number of files) and a curl command;
+    fetch(url, name?) downloads a public URL into blobs/; put_blob(content_base64, name) is for small
+    inline content only. All three return the stored blob's path, sha256, size, mime, filename and url.
+    """
     if action == "read":
         res = await anyio.to_thread.run_sync(
             lambda: files.read_file(config.VAULT_ROOT, path, offset=offset, limit=limit)
@@ -120,9 +130,15 @@ async def file(
         if rel.startswith("usr/views/") and rel.endswith(".sql"):
             await anyio.to_thread.run_sync(lambda: store.reload_views(config.DB_PATH, config.VIEWS_DIR))
         return res
+    if action == "upload_link":
+        return uploads.new_upload_link(name)
+    if action == "fetch":
+        if not url:
+            raise ValueError("fetch needs a url")
+        return await anyio.to_thread.run_sync(lambda: uploads.fetch(url, name))
     if action == "put_blob":
         data = base64.b64decode("".join(content_base64.split()), validate=True)
-        return await anyio.to_thread.run_sync(lambda: files.put_blob(config.VAULT_ROOT, data, ext=ext))
+        return await anyio.to_thread.run_sync(lambda: uploads.store_bytes(data, name or "file"))
     if action == "delete":
         res = await anyio.to_thread.run_sync(lambda: files.delete_file(config.VAULT_ROOT, path))
         rel = str(res["path"])
@@ -170,12 +186,34 @@ async def verify(request: Request) -> Response:
     return Response(status_code=signing.verify(uri))
 
 
+STATUS_TEXT = {403: "invalid upload link\n", 410: "upload link expired\n"}
+
+
+async def put_file(request: Request) -> Response:
+    """One file of an upload link, streamed into blobs/ before the response."""
+    raw = request.scope["raw_path"].decode("latin-1") + "?" + request.scope["query_string"].decode("latin-1")
+    status = signing.verify(raw)
+    if status != 200:
+        return PlainTextResponse(STATUS_TEXT.get(status, "forbidden\n"), status_code=status)
+    length = int(request.headers.get("content-length") or 0)
+    if length > config.UPLOAD_MAX_BYTES:
+        return PlainTextResponse(f"larger than {config.UPLOAD_MAX_BYTES // 1024**2} MB\n", status_code=413)
+    try:
+        if length:
+            await anyio.to_thread.run_sync(uploads.check_quota, length)
+        result = await uploads.receive(request.stream(), request.path_params["name"])
+    except ValueError as e:
+        return PlainTextResponse(f"{e}\n", status_code=413)
+    return JSONResponse(result, status_code=200 if result["duplicate"] else 201)
+
+
 def build() -> FastMCP:
     """Construct the configured FastMCP server."""
     server = FastMCP("vault", instructions=INSTRUCTIONS, auth=build_auth(), middleware=[Gatekeeper()])
     server.mount(vault)
     server.custom_route("/healthz", methods=["GET"])(healthz)
     server.custom_route("/_verify", methods=["GET", "HEAD"])(verify)
+    server.custom_route("/u/{ticket}/{name}", methods=["PUT"])(put_file)
     return server
 
 
@@ -189,6 +227,7 @@ def _startup_sync() -> None:
     while True:
         try:
             documents.sync(config.vec_db_path())
+            uploads.prune()
         except Exception:
             log.exception("documents index sync failed")
         if config.DOCS_SYNC_SECONDS <= 0:

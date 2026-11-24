@@ -48,7 +48,12 @@ GITHUB_CLIENT_SECRET = env("GITHUB_CLIENT_SECRET", "")
 JWT_SIGNING_KEY = env("JWT_SIGNING_KEY", "")
 ALLOWED_GITHUB_LOGINS = set(filter(None, env("ALLOWED_GITHUB_LOGINS", "").split(",")))
 API_KEYS = _pairs(env("API_KEYS", ""))
-# Signed, expiring download links (/f/<blob>/<name>, /d/<path>), checked by /_verify for Caddy.
+# Signed, expiring links: downloads (/f/<blob>/<name>, /d/<path>, checked by /_verify for Caddy) and
+# uploads (PUT /u/<ticket>/<name>, streamed into blobs/ by the server).
 LINK_SECRET = env("LINK_SECRET", "")
 LINK_TTL = int(env("LINK_TTL_SECONDS", str(7 * 86400)))
+UPLOAD_TTL = int(env("UPLOAD_TTL_SECONDS", "3600"))
+UPLOAD_MAX_BYTES = int(env("UPLOAD_MAX_BYTES", str(8 * 1024**3)))
+FETCH_MAX_BYTES = int(env("FETCH_MAX_BYTES", str(2 * 1024**3)))
+QUOTA_BYTES = int(env("FILES_QUOTA_BYTES", str(30 * 1024**3)))  # all of blobs/
 SQL_TIMEOUT_SECONDS = float(env("SQL_TIMEOUT_SECONDS", "5"))

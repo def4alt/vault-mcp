@@ -1,10 +1,12 @@
-"""Signed, expiring download links: the only way file bytes leave the vault.
+"""Signed, expiring links: the only way file bytes move in or out of the vault.
 
     /f/<blob>/<name>   a stored file (blobs/<blob>) saved under `name`; Caddy serves it from blobs/
     /d/<path>          a document under DOCS_ROOT; Caddy serves it from the documents tree
+    /u/<ticket>/<name> PUT target of an upload link; the server streams the body into blobs/
 
-The signature is HMAC-SHA256 over "<scope>\\n<expires>", where the scope is /f/<blob> or /d/<path>
-(percent-decoded). Caddy asks /_verify before serving either prefix.
+The signature is HMAC-SHA256 over "<scope>\\n<expires>", where the scope is /f/<blob>, /d/<path> or
+/u/<ticket> (percent-decoded). The name after a blob or ticket is free, so one upload link takes any number
+of files and a download can be saved under any name. Caddy asks /_verify before serving /f and /d.
 """
 from __future__ import annotations
 
@@ -19,6 +21,7 @@ from pathlib import Path
 from . import config
 
 BLOB = re.compile(r"[0-9a-f]{16,64}(\.[a-z0-9]{1,10})?")
+TICKET = re.compile(r"[0-9a-f]{16,64}")
 
 
 def safe_name(name: str) -> str:
@@ -40,18 +43,24 @@ def scope_of(path: str) -> str | None:
     parts = path.split("/")
     if len(parts) == 4 and parts[1] == "f" and BLOB.fullmatch(parts[2]) and parts[3]:
         return f"/f/{parts[2]}"
+    if len(parts) == 4 and parts[1] == "u" and TICKET.fullmatch(parts[2]) and parts[3]:
+        return f"/u/{parts[2]}"
     if len(parts) >= 3 and parts[1] == "d" and all(p and not p.startswith(".") for p in parts[2:]):
         return path
     return None
 
 
 def _sign(path: str, ttl: int | None) -> str:
+    return _sign_with_expiry(path, ttl)[0]
+
+
+def _sign_with_expiry(path: str, ttl: int | None) -> tuple[str, int]:
     scope = scope_of(path)
     if scope is None:
         raise ValueError(f"`{path}` cannot be linked")
     expires = int(time.time()) + (config.LINK_TTL if ttl is None else ttl)
     query = urllib.parse.urlencode({"e": expires, "s": _mac(scope, expires)})
-    return f"{config.PUBLIC_URL}{urllib.parse.quote(path)}?{query}"
+    return f"{config.PUBLIC_URL}{urllib.parse.quote(path)}?{query}", expires
 
 
 def blob_link(blob: str, name: str | None = None, ttl: int | None = None) -> str:
@@ -62,6 +71,13 @@ def blob_link(blob: str, name: str | None = None, ttl: int | None = None) -> str
 
 def document_link(rel: str, ttl: int | None = None) -> str:
     return _sign("/d/" + rel.strip("/"), ttl)
+
+
+def upload_link(ticket: str, ttl: int | None = None) -> tuple[str, int]:
+    """(PUT URL template with a {filename} placeholder, expiry as epoch seconds)."""
+    url, expires = _sign_with_expiry(f"/u/{ticket}/x", config.UPLOAD_TTL if ttl is None else ttl)
+    path, query = url.split("?", 1)
+    return f"{path.rsplit('/', 1)[0]}/{{filename}}?{query}", expires
 
 
 def verify(raw_uri: str) -> int:

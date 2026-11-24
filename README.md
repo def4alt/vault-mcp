@@ -13,12 +13,12 @@ Two SQLite databases (WAL mode, `STRICT` tables):
 
 - `sql(query, params?, limit=100, cursor?)`: run one parameterized SQL statement against `vault.db` (and read `vec.*` with `embed(text)` / `cosine(a, b)` UDFs) under a SQLite authorizer and timeout. Mutating statements delta-sync `vectors.db` automatically.
 - `recall(query, budget=1800, limit=6)`: hybrid `int8` vector KNN across `vec.items_vec` and `vec.episodes_vec`, exact slug/title boost, escaped `LIKE` opaque-code fallback, post-ranking 1-hop `requires`/`contradicts`/`part_of`/`relates` context attachment, armed cues, matching document passages, and token-budget packing.
-- `file(action, path?, content?, content_base64?, ext?, offset=0, limit=20000)`: path-jailed file access inside `$VAULT_ROOT` (`read`, `write`, `put_blob`, `delete`). Writes to `usr/views/*.sql` reload userspace SQL views live. Reading a blob returns a signed download `url`.
+- `file(action, path?, content?, content_base64?, name?, url?, offset=0, limit=20000)`: path-jailed file access inside `$VAULT_ROOT` (`read`, `write`, `delete`) and the ways a file comes in: `upload_link` (signed PUT URL + `curl -T` command), `fetch` (the server downloads a public URL), `put_blob` (small inline base64). All three file a content-addressed blob and return its `path`, `sha256`, `mime`, `filename` and download `url`. Writes to `usr/views/*.sql` reload userspace SQL views live. Reading a blob returns a signed download `url`.
 - `document(path, offset=0, limit=20000)`: extracted text of a document under `$DOCS_ROOT` (PDF via `pdftotext`, Office, plain text; cached by content hash in `$CACHE_ROOT/text`) plus a signed download `url`.
 
-## Downloads
+## Uploads and downloads
 
-File bytes leave only through signed, expiring links: `/f/<blob>/<name>` (stored files) and `/d/<path>` (documents). Caddy serves both from disk after a `forward_auth` check against `/_verify` (HMAC over `LINK_SECRET`).
+File bytes move only through signed, expiring links (HMAC over `LINK_SECRET`), never through a model. `PUT /u/<ticket>/<name>` streams an upload into `$VAULT_ROOT/.incoming/` and files it under `blobs/` (`UPLOAD_MAX_BYTES`, default 8 GB; `FILES_QUOTA_BYTES`, default 30 GB). `/f/<blob>/<name>` (stored files) and `/d/<path>` (documents) are served by Caddy from disk after a `forward_auth` check against `/_verify`.
 
 ## Auth & environment
 
