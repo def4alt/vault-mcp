@@ -13,7 +13,9 @@ def _pairs(text: str) -> dict[str, str]:
 
 
 VAULT_ROOT = Path(env("VAULT_ROOT", "/vault"))
-CACHE_ROOT = Path(env("CACHE_ROOT", "/cache"))
+DOCS_ROOT = Path(env("DOCS_ROOT", "/documents"))  # Andrii's documents (Syncthing), read-only to the server
+DOCS_SYNC_SECONDS = int(env("DOCS_SYNC_SECONDS", "300"))  # how often the documents index is refreshed; 0 = never
+CACHE_ROOT = Path(env("CACHE_ROOT", "/cache"))  # embedding model and extracted document text
 DB_PATH = Path(env("DB_PATH", "/db/vault.db"))
 VEC_DB_PATH: Path | None = Path(v) if (v := env("VEC_DB_PATH")) else None
 VIEWS_DIR = Path(env("VIEWS_DIR", str(VAULT_ROOT / "usr" / "views")))
@@ -46,4 +48,7 @@ GITHUB_CLIENT_SECRET = env("GITHUB_CLIENT_SECRET", "")
 JWT_SIGNING_KEY = env("JWT_SIGNING_KEY", "")
 ALLOWED_GITHUB_LOGINS = set(filter(None, env("ALLOWED_GITHUB_LOGINS", "").split(",")))
 API_KEYS = _pairs(env("API_KEYS", ""))
+# Signed, expiring download links (/f/<blob>/<name>, /d/<path>), checked by /_verify for Caddy.
+LINK_SECRET = env("LINK_SECRET", "")
+LINK_TTL = int(env("LINK_TTL_SECONDS", str(7 * 86400)))
 SQL_TIMEOUT_SECONDS = float(env("SQL_TIMEOUT_SECONDS", "5"))

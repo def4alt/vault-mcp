@@ -1,10 +1,16 @@
-"""Vault MCP server: sql, recall, and file tools with MultiAuth + Gatekeeper middleware."""
+"""Vault MCP server: sql, recall, file and document tools with MultiAuth + Gatekeeper middleware.
+
+HTTP routes besides /mcp and OAuth:
+    /_verify   Caddy's forward_auth check for signed /f (stored files) and /d (documents) downloads
+    /healthz
+"""
 from __future__ import annotations
 
 import base64
 import contextlib
 import logging
 import threading
+import time
 from typing import Any
 
 import anyio
@@ -12,9 +18,9 @@ from fastmcp import FastMCP
 from mcp import types as mt
 from prometheus_client import start_http_server
 from starlette.requests import Request
-from starlette.responses import PlainTextResponse
+from starlette.responses import PlainTextResponse, Response
 
-from .. import config, embed, files, store
+from .. import config, documents, embed, files, signing, store
 from .auth import Gatekeeper, build_auth
 
 log = logging.getLogger("vault-server")
@@ -31,13 +37,18 @@ INSTRUCTIONS = (
     "Built-in views: `v_active_items`, `v_due_cues`, `v_unconsolidated_episodes`, "
     "`v_cooccurrence`, `v_cooccurrence_window`, `v_concept_state`, `v_review_queue`, `v_study_next`. "
     "Vector tables in the rebuildable vector database are attached read-only as `vec` "
-    "(`vec.items_vec`, `vec.episodes_vec`) with SQL functions `embed(text)` and `cosine(a, b)`.\n\n"
+    "(`vec.items_vec`, `vec.episodes_vec`, and the documents index `vec.documents(path, folder, name, media, "
+    "mime, size, sha256, chunks)` + `vec.doc_chunks(path, chunk, text, embedding)`) "
+    "with SQL functions `embed(text)` and `cosine(a, b)`.\n\n"
     "Tools:\n"
     "- `recall(query, budget=1800, limit=6)`: retrieve working memory (semantic vector hits, exact/opaque matches, "
-    "1-hop attached neighbors, armed cues, and relevant episodes) within a token budget.\n"
+    "1-hop attached neighbors, armed cues, relevant episodes, and matching document passages) within a token budget.\n"
     "- `sql(query, params?, limit=100, cursor?)`: run one parameterized SQL read or write statement; "
     "mutating statements delta-sync vector embeddings automatically.\n"
-    "- `file(action, ...)`: manage files under `$VAULT_ROOT` (`read`, `write`, `put_blob`, `delete`).\n\n"
+    "- `file(action, ...)`: manage files under `$VAULT_ROOT` (`read`, `write`, `put_blob`, `delete`); "
+    "reading a stored blob returns a signed download `url`.\n"
+    "- `document(path, offset=0, limit=20000)`: read one of Andrii's documents (e.g. `University/x.pdf`) as "
+    "extracted text, with a signed download `url`. List them with `SELECT path FROM vec.documents`.\n\n"
     "Resources: `vault://schema`, `vault://views`.\n"
     "Privacy: items with `json_extract(props, '$.private') = 1` are strictly private for helping Andrii directly; "
     "never quote or summarize them in CVs, emails, work docs, or external outputs."
@@ -96,9 +107,13 @@ async def file(
 ) -> dict[str, Any]:
     """Operate strictly inside $VAULT_ROOT: action in read | write | put_blob | delete."""
     if action == "read":
-        return await anyio.to_thread.run_sync(
+        res = await anyio.to_thread.run_sync(
             lambda: files.read_file(config.VAULT_ROOT, path, offset=offset, limit=limit)
         )
+        rel = str(res["path"])
+        if rel.startswith("blobs/") and config.LINK_SECRET:
+            res["url"] = signing.blob_link(rel)
+        return res
     if action == "write":
         res = await anyio.to_thread.run_sync(lambda: files.write_file(config.VAULT_ROOT, path, content))
         rel = str(res["path"])
@@ -115,6 +130,15 @@ async def file(
             await anyio.to_thread.run_sync(lambda: store.reload_views(config.DB_PATH, config.VIEWS_DIR))
         return res
     raise ValueError(f"unsupported file action: {action}")
+
+
+@vault.tool(annotations=_annotations("Read a document", read_only=True))
+async def document(path: str, offset: int = 0, limit: int = files.DEFAULT_READ_LIMIT) -> dict[str, Any]:
+    """Read one of Andrii's documents under the documents tree as extracted text, with a download url."""
+    res = await anyio.to_thread.run_sync(lambda: documents.read(path, offset=offset, limit=limit))
+    if config.LINK_SECRET:
+        res["url"] = signing.document_link(str(res["path"]))
+    return res
 
 
 @vault.resource("vault://schema")
@@ -141,11 +165,17 @@ async def healthz(_: Request) -> PlainTextResponse:
     return PlainTextResponse("ok\n" if ok else "vault not initialized\n", status_code=200 if ok else 503)
 
 
+async def verify(request: Request) -> Response:
+    uri = request.headers.get("x-forwarded-uri", "")
+    return Response(status_code=signing.verify(uri))
+
+
 def build() -> FastMCP:
     """Construct the configured FastMCP server."""
     server = FastMCP("vault", instructions=INSTRUCTIONS, auth=build_auth(), middleware=[Gatekeeper()])
     server.mount(vault)
     server.custom_route("/healthz", methods=["GET"])(healthz)
+    server.custom_route("/_verify", methods=["GET", "HEAD"])(verify)
     return server
 
 
@@ -156,9 +186,18 @@ def _startup_sync() -> None:
         log.info("background vector warmup complete (%d rows synced)", synced)
     except Exception:
         log.exception("background vector warmup failed")
+    while True:
+        try:
+            documents.sync(config.vec_db_path())
+        except Exception:
+            log.exception("documents index sync failed")
+        if config.DOCS_SYNC_SECONDS <= 0:
+            return
+        time.sleep(config.DOCS_SYNC_SECONDS)
 
 
 def main() -> None:
+    logging.basicConfig(level=logging.INFO, format="%(asctime)s %(name)s %(levelname)s %(message)s")
     store.init_db(config.DB_PATH, views_dir=config.VIEWS_DIR, vec_db_path=config.vec_db_path())
     threading.Thread(target=_startup_sync, daemon=True).start()
     if config.METRICS_PORT:

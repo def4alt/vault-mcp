@@ -17,7 +17,7 @@ from fastmcp import Client
 from fastmcp.client.transports import StreamableHttpTransport
 from fastmcp.exceptions import ToolError
 
-from vault_mcp import config, embed, files, store
+from vault_mcp import config, documents, embed, files, signing, store
 from vault_mcp.app.auth import ApiKeys, Gatekeeper, build_auth
 from vault_mcp.app.server import build
 
@@ -67,6 +67,8 @@ def env(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
     views_dir.mkdir(parents=True)
     settings = {
         "VAULT_ROOT": root,
+        "DOCS_ROOT": tmp_path / "documents",
+        "LINK_SECRET": "test-link-secret",
         "CACHE_ROOT": tmp_path / "cache",
         "DB_PATH": db_path,
         "VEC_DB_PATH": None,
@@ -128,7 +130,7 @@ def test_two_db_split_and_migrations_versioning(env, tmp_path: Path) -> None:
         vec_tables = {
             r["name"] for r in vconn.execute("SELECT name FROM sqlite_master WHERE type = 'table'").fetchall()
         }
-        assert vec_tables == {"items_vec", "episodes_vec"}
+        assert vec_tables == {"items_vec", "episodes_vec", "documents", "doc_chunks"}
 
     mdir = tmp_path / "migrations"
     shutil.copytree(store.MIGRATIONS_DIR, mdir)
@@ -469,7 +471,56 @@ async def test_auth_keys_gatekeeper_and_live_http(server: str, monkeypatch: pyte
     transport = StreamableHttpTransport(f"{server}/mcp", headers={"Authorization": "Bearer opencode-key"})
     async with Client(transport) as client:
         tools = {t.name for t in await client.list_tools()}
-        assert tools == {"sql", "recall", "file"}
+        assert tools == {"sql", "recall", "file", "document"}
         res = await client.call_tool("sql", {"query": "SELECT 1 AS ok"})
         data = res.structured_content or res.data
         assert data["rows"] == [{"ok": 1}]
+
+
+async def test_documents_index_read_recall_and_signed_links(env, tmp_path: Path, monkeypatch) -> None:
+    root, db_path, vec_path = env
+    docs = config.DOCS_ROOT
+    (docs / "University").mkdir(parents=True)
+    (docs / ".stversions").mkdir()
+    (docs / "University" / "thesis-proposal.md").write_text(
+        "# Proposal\n\nMonocular drone view 3D object detection with depth priors.\n\n"
+        + "\n\n".join(f"Paragraph {i} about evaluation protocols." for i in range(40))
+    )
+    (docs / "Personal").mkdir()
+    (docs / "Personal" / "page.html").write_text("<script>alert(1)</script>")
+    (docs / ".stversions" / "old.md").write_text("hidden version")
+
+    assert documents.sync(vec_path) == 1
+    assert documents.sync(vec_path) == 0  # unchanged files are skipped
+    listed = await call("sql", query="SELECT path, folder, chunks FROM vec.documents")
+    assert listed["rows"] == [{"path": "University/thesis-proposal.md", "folder": "University", "chunks": 2}]
+
+    doc = await call("document", path="University/thesis-proposal.md", limit=30)
+    assert doc["text"].startswith("# Proposal") and doc["truncated"] and doc["next_offset"] == 30
+    assert signing.verify(doc["url"].removeprefix(config.PUBLIC_URL)) == 200
+    with pytest.raises(ToolError):
+        await call("document", path="../vault/usr/x.sql")
+    with pytest.raises(ToolError):
+        await call("document", path=".stversions/old.md")
+
+    monkeypatch.setattr(store, "DOC_MIN_SIMILARITY", 0.05)  # hashed test embeddings score lower than Harrier
+    pkt = await call("recall", query="monocular drone 3D object detection depth priors", budget=4000)
+    assert pkt["documents"][0]["path"] == "University/thesis-proposal.md"
+    assert "url" in pkt["documents"][0]
+
+    (docs / "University" / "thesis-proposal.md").unlink()
+    assert documents.sync(vec_path) == 1
+    assert (await call("sql", query="SELECT count(*) AS n FROM vec.doc_chunks"))["rows"] == [{"n": 0}]
+
+
+async def test_blob_links_and_verify(env) -> None:
+    root, _, _ = env
+    put = files.put_blob(root, b"%PDF-1.4 fake", ext="pdf")
+    res = await call("file", action="read", path=put["path"])
+    assert res["binary"] and res["url"].startswith(f"{config.PUBLIC_URL}/f/")
+    good = res["url"].removeprefix(config.PUBLIC_URL)
+    assert signing.verify(good) == 200
+    assert signing.verify(good.replace("s=", "s=x")) == 403
+    assert signing.verify("/f/" + "0" * 16 + "/x?e=1&s=abc") == 403
+    expired = signing.blob_link(put["path"], "x.pdf", ttl=-10).removeprefix(config.PUBLIC_URL)
+    assert signing.verify(expired) == 410

@@ -12,7 +12,7 @@ import time
 from pathlib import Path
 from typing import Any
 
-from . import config, embed
+from . import config, documents, embed, signing
 
 CELL_MAX = 2000
 RESULT_MAX = 100_000
@@ -313,7 +313,8 @@ def rebuild_cli() -> None:
     """CLI entrypoint (`vault-rebuild-vectors`) for rebuilding `vectors.db`."""
     init_db()
     count = rebuild_vectors()
-    print(f"rebuilt vectors.db: {count} rows encoded ({embed.model_id()})")
+    docs = documents.sync(config.vec_db_path(), force=True)
+    print(f"rebuilt vectors.db: {count} rows and {docs} documents encoded ({embed.model_id()})")
 
 
 def _encode_cursor(offset: int) -> str:
@@ -441,6 +442,34 @@ def _like_pattern(token: str) -> str:
     return f"%{escaped}%"
 
 
+DOC_MIN_SIMILARITY = 0.45
+
+
+def _document_hits(vc: sqlite3.Connection, q_vec: bytes | None, k: int) -> list[dict[str, Any]]:
+    """Best document passages for a query, at most one per document, with a download link."""
+    if vc.execute("SELECT 1 FROM sqlite_master WHERE name = 'doc_chunks'").fetchone() is None:
+        return []
+    rows = [((r["path"], r["chunk"]), r["embedding"])
+            for r in vc.execute("SELECT path, chunk, embedding FROM doc_chunks").fetchall()]
+    hits: list[dict[str, Any]] = []
+    seen: set[str] = set()
+    for (path, chunk), sim in embed.nearest_int8(q_vec, rows, 4 * k):
+        if sim < DOC_MIN_SIMILARITY or path in seen:
+            continue
+        seen.add(path)
+        meta = vc.execute("SELECT name, mime FROM documents WHERE path = ?", (path,)).fetchone()
+        text = vc.execute("SELECT text FROM doc_chunks WHERE path = ? AND chunk = ?", (path, chunk)).fetchone()
+        try:
+            url = signing.document_link(path)
+        except ValueError:
+            url = None
+        hits.append({"path": path, "name": meta["name"] if meta else path, "mime": meta["mime"] if meta else None,
+                     "chunk": chunk, "score": round(sim, 4), "text": text["text"] if text else "", "url": url})
+        if len(hits) >= max(1, k // 2):
+            break
+    return hits
+
+
 def recall(
     db_path: Path | str | None,
     query_text: str,
@@ -477,9 +506,11 @@ def recall(
                     (r["episode_id"], r["embedding"])
                     for r in vc.execute("SELECT episode_id, embedding FROM episodes_vec").fetchall()
                 ]
+                doc_hits = _document_hits(vc, q_vec, k)
         else:
             item_vec_rows = []
             ep_vec_rows = []
+            doc_hits = []
 
         item_vec_scores = dict(embed.nearest_int8(q_vec, item_vec_rows, len(item_vec_rows)))
         ep_vec_hits = [
@@ -663,6 +694,7 @@ def recall(
         "items": [],
         "attached_items": [],
         "episodes": [],
+        "documents": [],
     }
     used = _estimate_tokens(packet)
     for item in top_items_full:
@@ -679,6 +711,11 @@ def recall(
         cost = _estimate_tokens(ep)
         if used + cost <= budget:
             packet["episodes"].append(ep)
+            used += cost
+    for doc in doc_hits:
+        cost = _estimate_tokens(doc)
+        if used + cost <= budget:
+            packet["documents"].append(doc)
             used += cost
     packet["approx_tokens"] = used
     return packet
