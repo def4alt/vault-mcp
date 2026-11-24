@@ -1,609 +1,684 @@
-"""The vault is one SQLite file. Six tables hold canonical data; the rest is derived.
-
-    pages       id, title, body, private, updated         every page: notes/x, sources/x, projects/x, files/x
-    facts       id, subject, claim, valid_from, valid_until, confirmed, source, note
-    questions   id, question, about, asked, asked_by, answer, answered     what agents need me to answer
-    files       id (its page), blob, sha256, mime, size, name, versions    stored files, described by their page
-    queries     name, sql, about                           saved queries: tools as data
-    log         time, actor, message, changed, sha         every write, with the git commit of its export
-
-Derived, rebuilt from the above (`vault-import --export`; the worker indexes documents): links, chunks, fts,
-documents, blobs, and the views current_facts and problems.
-
-Agents read with one SELECT (`run_sql`) and change rows with ordinary INSERT/UPDATE/DELETE statements
-(`apply`): one call is one transaction, one log row and one git commit of the Markdown export.
-Triggers put every page a change touches into `touched`; `drain` re-derives and re-exports those.
-"""
+"""SQLite store for Vault: two-DB split (vault.db + rebuildable int8 vectors.db)."""
 from __future__ import annotations
 
 import base64
 import contextlib
+import hashlib
 import json
-import logging
 import re
 import sqlite3
+import threading
 import time
-from collections.abc import Iterator
 from pathlib import Path
+from typing import Any
 
-from . import config, documents, embed, markdown, pages, repo, signing
+from . import config, embed
 
-log = logging.getLogger("vault-store")
-SCHEMA_VERSION = "2"
-DATE = "GLOB '[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]'"
-NOW = "strftime('%Y-%m-%dT%H:%M:%fZ', 'now')"
-WRITABLE = {"pages", "facts", "questions", "queries", "blobs"}
-MANY = 20  # rows one statement may change unless it says `many`
-STALE_DAYS = 365
-
-DDL = f"""
-CREATE TABLE meta(key TEXT PRIMARY KEY, value TEXT);
-
-CREATE TABLE pages(
-  id TEXT PRIMARY KEY CONSTRAINT "page id: letters, digits, - and _ in folders, e.g. notes/acme"
-    CHECK (id GLOB '[A-Za-z0-9]*' AND id NOT GLOB '*[^A-Za-z0-9/_-]*'),
-  title TEXT NOT NULL CONSTRAINT "a page needs a title" CHECK (length(trim(title)) > 0),
-  body TEXT NOT NULL DEFAULT ''
-    CONSTRAINT "facts are rows of the facts table: do not paste the exported table into a body"
-    CHECK (instr(body, '| # | Claim | From | Until | Confirmed | Source | Note |') = 0),
-  private INTEGER NOT NULL DEFAULT 0 CONSTRAINT "private is 0 or 1" CHECK (private IN (0, 1)),
-  updated TEXT NOT NULL DEFAULT ({NOW})
-);
-CREATE TABLE facts(
-  id INTEGER PRIMARY KEY,
-  subject TEXT NOT NULL REFERENCES pages(id) ON UPDATE CASCADE ON DELETE CASCADE,
-  claim TEXT NOT NULL CONSTRAINT "a fact needs a claim" CHECK (length(trim(claim)) > 0),
-  valid_from TEXT NOT NULL CONSTRAINT "valid_from must be YYYY-MM-DD" CHECK (valid_from {DATE}),
-  valid_until TEXT CONSTRAINT "valid_until must be NULL or YYYY-MM-DD, not before valid_from"
-    CHECK (valid_until IS NULL OR (valid_until {DATE} AND valid_until >= valid_from)),
-  confirmed TEXT CONSTRAINT "confirmed must be NULL or the YYYY-MM-DD date I confirmed it"
-    CHECK (confirmed IS NULL OR confirmed {DATE}),
-  source TEXT,
-  note TEXT
-);
-CREATE TABLE questions(
-  id INTEGER PRIMARY KEY,
-  question TEXT NOT NULL CONSTRAINT "a question needs text" CHECK (length(trim(question)) > 0),
-  about TEXT,
-  asked TEXT NOT NULL DEFAULT (date('now')),
-  asked_by TEXT,
-  answer TEXT,
-  answered TEXT
-);
-CREATE TABLE files(
-  id TEXT PRIMARY KEY REFERENCES pages(id) ON UPDATE CASCADE ON DELETE CASCADE,
-  blob TEXT NOT NULL, sha256 TEXT NOT NULL, mime TEXT, size INTEGER, name TEXT,
-  versions TEXT NOT NULL DEFAULT '[]'
-);
-CREATE TABLE queries(name TEXT PRIMARY KEY, sql TEXT NOT NULL, about TEXT);
-CREATE TABLE log(
-  id INTEGER PRIMARY KEY, time TEXT NOT NULL DEFAULT ({NOW}), actor TEXT, message TEXT, changed TEXT, sha TEXT,
-  key TEXT
-);
-CREATE TABLE touched(id TEXT PRIMARY KEY) WITHOUT ROWID;
-
--- derived
-CREATE TABLE links(src TEXT NOT NULL, dst TEXT NOT NULL);
-CREATE TABLE chunks(id INTEGER PRIMARY KEY, ref TEXT NOT NULL, page TEXT NOT NULL, title TEXT, text TEXT NOT NULL,
-                    embedding BLOB);
-CREATE VIRTUAL TABLE fts USING fts5(title, text, tokenize='unicode61 remove_diacritics 2');
-CREATE TABLE documents(id TEXT PRIMARY KEY, path TEXT, folder TEXT, name TEXT, media TEXT, mime TEXT, size INTEGER,
-                       sha256 TEXT, mtime REAL);
-CREATE TABLE blobs(name TEXT PRIMARY KEY, size INTEGER);
-CREATE INDEX facts_subject ON facts(subject);
-CREATE INDEX links_dst ON links(dst);
-CREATE INDEX links_src ON links(src);
-CREATE INDEX chunks_page ON chunks(page);
-CREATE INDEX files_sha ON files(sha256);
-
-CREATE VIEW current_facts AS
-  SELECT * FROM facts WHERE valid_from <= date('now') AND (valid_until IS NULL OR valid_until >= date('now'));
-CREATE VIEW problems AS
-  SELECT 'broken-link' AS kind, src AS id, 'links to ' || dst || ', which does not exist' AS detail FROM links
-   WHERE dst NOT LIKE 'doc:%' AND dst NOT LIKE 'blobs/%' AND NOT EXISTS (SELECT 1 FROM pages WHERE id = dst)
-  UNION ALL
-  SELECT 'broken-link', src, 'embeds ' || dst || ', which is not stored' FROM links
-   WHERE dst LIKE 'blobs/%' AND NOT EXISTS (SELECT 1 FROM blobs WHERE 'blobs/' || name = dst)
-  UNION ALL
-  SELECT 'stale', subject || '#fact-' || id, claim || ' (confirmed ' || confirmed || ', over a year ago)' FROM facts
-   WHERE valid_until IS NULL AND confirmed IS NOT NULL AND confirmed < date('now', '-{STALE_DAYS} days')
-  UNION ALL
-  SELECT 'question', 'questions#' || id, question FROM questions WHERE answer IS NULL
-  UNION ALL
-  SELECT 'orphan', id, 'no page links here and it links to none' FROM pages p
-   WHERE id LIKE 'notes/%' AND NOT EXISTS (SELECT 1 FROM links WHERE src = p.id OR dst = p.id)
-  UNION ALL
-  SELECT 'undistilled', id, 'no page or fact cites it yet' FROM pages p
-   WHERE (id LIKE 'sources/%' OR id LIKE 'files/%') AND NOT EXISTS (SELECT 1 FROM links WHERE dst = p.id)
-  UNION ALL
-  SELECT 'blob', 'blobs/' || name, 'no file page describes it (describe it, or DELETE FROM blobs WHERE name = ...)'
-    FROM blobs b WHERE NOT EXISTS (SELECT 1 FROM files WHERE blob = 'blobs/' || b.name
-                                   OR instr(versions, '"blobs/' || b.name || '"') > 0)
-  UNION ALL
-  SELECT 'blob', id, 'its file ' || blob || ' is missing' FROM files f
-   WHERE NOT EXISTS (SELECT 1 FROM blobs WHERE 'blobs/' || name = f.blob);
-
--- every change marks the pages it touches; drain() re-derives and re-exports them
-CREATE TRIGGER pages_ins AFTER INSERT ON pages BEGIN INSERT OR IGNORE INTO touched VALUES (NEW.id); END;
-CREATE TRIGGER pages_del AFTER DELETE ON pages BEGIN INSERT OR IGNORE INTO touched VALUES (OLD.id); END;
-CREATE TRIGGER pages_upd AFTER UPDATE ON pages BEGIN
-  INSERT OR IGNORE INTO touched VALUES (NEW.id);
-  INSERT OR IGNORE INTO touched VALUES (OLD.id);
-  UPDATE pages SET updated = {NOW} WHERE id = NEW.id AND NEW.updated = OLD.updated;
-END;
-CREATE TRIGGER pages_rename AFTER UPDATE OF id ON pages WHEN NEW.id <> OLD.id BEGIN
-  UPDATE pages SET body = replace(replace(body, '[[' || OLD.id || ']]', '[[' || NEW.id || ']]'),
-                                  '[[' || OLD.id || '|', '[[' || NEW.id || '|')
-   WHERE instr(body, '[[' || OLD.id) > 0;
-  UPDATE facts SET source = replace(source, '[[' || OLD.id || ']]', '[[' || NEW.id || ']]')
-   WHERE instr(source, '[[' || OLD.id || ']]') > 0;
-END;
-CREATE TRIGGER facts_ins AFTER INSERT ON facts BEGIN INSERT OR IGNORE INTO touched VALUES (NEW.subject); END;
-CREATE TRIGGER facts_del AFTER DELETE ON facts BEGIN INSERT OR IGNORE INTO touched VALUES (OLD.subject); END;
-CREATE TRIGGER facts_upd AFTER UPDATE ON facts BEGIN
-  INSERT OR IGNORE INTO touched VALUES (NEW.subject);
-  INSERT OR IGNORE INTO touched VALUES (OLD.subject);
-END;
-CREATE TRIGGER files_ins AFTER INSERT ON files BEGIN INSERT OR IGNORE INTO touched VALUES (NEW.id); END;
-CREATE TRIGGER files_upd AFTER UPDATE ON files BEGIN INSERT OR IGNORE INTO touched VALUES (NEW.id); END;
-CREATE TRIGGER questions_ins AFTER INSERT ON questions BEGIN INSERT OR IGNORE INTO touched VALUES ('questions'); END;
-CREATE TRIGGER questions_upd AFTER UPDATE ON questions BEGIN INSERT OR IGNORE INTO touched VALUES ('questions'); END;
-CREATE TRIGGER questions_del AFTER DELETE ON questions BEGIN INSERT OR IGNORE INTO touched VALUES ('questions'); END;
-CREATE TRIGGER queries_ins AFTER INSERT ON queries BEGIN INSERT OR IGNORE INTO touched VALUES ('queries'); END;
-CREATE TRIGGER queries_upd AFTER UPDATE ON queries BEGIN INSERT OR IGNORE INTO touched VALUES ('queries'); END;
-CREATE TRIGGER queries_del AFTER DELETE ON queries BEGIN INSERT OR IGNORE INTO touched VALUES ('queries'); END;
--- DELETE FROM blobs removes the file itself (drain unlinks it), unless a file page still uses it
-CREATE TRIGGER blobs_keep BEFORE DELETE ON blobs
-  WHEN NOT EXISTS (SELECT 1 FROM meta WHERE key = 'syncing-blobs')
-   AND EXISTS (SELECT 1 FROM files WHERE blob = 'blobs/' || OLD.name
-                                      OR instr(versions, '"blobs/' || OLD.name || '"') > 0)
-  BEGIN
-    SELECT RAISE(ABORT, 'this blob belongs to a file page (its file or an earlier version); delete that page first');
-  END;
-CREATE TRIGGER blobs_del AFTER DELETE ON blobs WHEN NOT EXISTS (SELECT 1 FROM meta WHERE key = 'syncing-blobs')
-  BEGIN INSERT OR IGNORE INTO touched VALUES ('blob:' || OLD.name); END;
-"""
-
-
-# --- connection ------------------------------------------------------------------------
-
-def _regexp(pattern: str, value: str | None) -> bool:
-    return value is not None and re.search(pattern, value, re.I | re.M) is not None
-
-
-def _link(target: str | None, name: str | None = None) -> str | None:
-    """SQL link(blob_or_doc_id [, name]): a signed download URL, valid for an hour."""
-    if not target:
-        return None
-    try:
-        if target.startswith("doc:"):
-            return signing.document_link(target.removeprefix("doc:"))
-        return signing.blob_link(target, name or target.rsplit("/", 1)[-1])
-    except documents.DocumentError:
-        return None
-
-
-def _functions(conn: sqlite3.Connection) -> None:
-    conn.create_function("regexp", 2, _regexp, deterministic=True)
-    conn.create_function("link", 1, _link)
-    conn.create_function("link", 2, _link)
-    conn.create_function("page_url", 1, pages.url)
-    conn.create_function("embed", 1, embed.query, deterministic=True)
-    conn.create_function("cosine", 2, embed.cosine, deterministic=True)
-
-
-@contextlib.contextmanager
-def connect() -> Iterator[sqlite3.Connection]:
-    path = config.DB_PATH
-    path.parent.mkdir(parents=True, exist_ok=True)
-    conn = sqlite3.connect(path, timeout=15, isolation_level=None)
-    try:
-        conn.row_factory = sqlite3.Row
-        conn.execute("PRAGMA journal_mode=WAL")
-        conn.execute("PRAGMA synchronous=NORMAL")
-        conn.execute("PRAGMA foreign_keys=ON")
-        _functions(conn)
-        try:
-            conn.execute("SELECT 1 FROM meta LIMIT 1")
-        except sqlite3.OperationalError:
-            _create(conn)
-        version = conn.execute("SELECT value FROM meta WHERE key = 'schema'").fetchone()[0]
-        if version != SCHEMA_VERSION:
-            raise RuntimeError(f"unsupported database schema {version}; expected {SCHEMA_VERSION}")
-        yield conn
-    finally:
-        conn.close()
-
-
-def _create(conn: sqlite3.Connection) -> None:
-    """Create the schema once; safe when the server and the worker start together."""
-    try:
-        conn.executescript(f"BEGIN IMMEDIATE;{DDL}INSERT INTO meta VALUES ('schema', '{SCHEMA_VERSION}');COMMIT;")
-    except sqlite3.OperationalError as e:
-        if conn.in_transaction:
-            conn.execute("ROLLBACK")
-        if "already exists" not in str(e):
-            raise
-
-
-# --- derived data ------------------------------------------------------------------------
-
-PIECE = 900  # characters a chunk aims for
-
-
-def split(text: str, limit: int = 80) -> list[str]:
-    """Paragraphs merged into chunks of about PIECE characters."""
-    out, current = [], ""
-    for para in filter(None, (p.strip() for p in re.split(r"\n\s*\n", text))):
-        if current and len(current) + len(para) > PIECE:
-            out.append(current)
-            current = ""
-        current = f"{current}\n\n{para}" if current else para
-        while len(current) > 2 * PIECE:
-            out.append(current[:2 * PIECE])
-            current = current[2 * PIECE:]
-    if current:
-        out.append(current)
-    return out[:limit]
-
-
-def fact_text(f: sqlite3.Row) -> str:
-    state = f"confirmed {f['confirmed']}" if f["confirmed"] else "unreviewed"
-    period = f"from {f['valid_from']} until {f['valid_until']}" if f["valid_until"] else \
-        f"from {f['valid_from']}, open-ended"
-    return " ".join(filter(None, [f["claim"], f["note"], f"({state}, {period})"]))
-
-
-def _set_chunks(conn: sqlite3.Connection, page: str, title: str, pieces: list[tuple[str, str]]) -> None:
-    known = dict(conn.execute("SELECT text, embedding FROM chunks WHERE page = ? AND title IS ? "
-                              "AND embedding IS NOT NULL", (page, title)))
-    conn.execute("DELETE FROM fts WHERE rowid IN (SELECT id FROM chunks WHERE page = ?)", (page,))
-    conn.execute("DELETE FROM chunks WHERE page = ?", (page,))
-    for ref, text in pieces:
-        # unchanged text keeps its vector; new text is embedded here by the hashed stand-in, later by the worker
-        vector = known.get(text) or (None if config.EMBED_MODEL else embed.passage(title, text))
-        cur = conn.execute("INSERT INTO chunks (ref, page, title, text, embedding) VALUES (?, ?, ?, ?, ?)",
-                           (ref, page, title, text, vector))
-        conn.execute("INSERT INTO fts (rowid, title, text) VALUES (?, ?, ?)", (cur.lastrowid, title, text))
-
-
-def derive(conn: sqlite3.Connection, pid: str) -> None:
-    """Rebuild links, chunks and embeddings of one page (or drop them if the page is gone)."""
-    conn.execute("DELETE FROM links WHERE src = ?", (pid,))
-    page = conn.execute("SELECT * FROM pages WHERE id = ?", (pid,)).fetchone()
-    if page is None:
-        _set_chunks(conn, pid, "", [])
-        return
-    facts = conn.execute("SELECT * FROM facts WHERE subject = ? ORDER BY id", (pid,)).fetchall()
-    text = "\n".join([page["body"], *(f"{f['source'] or ''} {f['note'] or ''}" for f in facts)])
-    targets = {t for t in markdown.link_targets(text) if t != pid}
-    conn.executemany("INSERT INTO links VALUES (?, ?)", [(pid, t) for t in sorted(targets)])
-    if "/" not in pid:  # AGENTS and index are instructions and navigation, not knowledge to search
-        _set_chunks(conn, pid, "", [])
-        return
-    pieces = [(pid, t) for t in split(page["body"])] or [(pid, page["title"])]
-    pieces += [(f"{pid}#fact-{f['id']}", fact_text(f)) for f in facts]
-    _set_chunks(conn, pid, page["title"], pieces)
-
-
-def drain(conn: sqlite3.Connection) -> list[str]:
-    """Re-derive and re-export every touched page; returns the export paths that changed (for the commit)."""
-    ids = [r[0] for r in conn.execute("SELECT id FROM touched ORDER BY id")]
-    if not ids:
-        return []
-    paths: list[str] = []
-    conn.execute("BEGIN IMMEDIATE")
-    for item in ids:
-        if item.startswith("blob:"):
-            (config.blobs_root() / item.removeprefix("blob:")).unlink(missing_ok=True)
-        elif item in ("questions", "queries"):
-            paths.append(markdown.export_table(conn, item))
-        else:
-            derive(conn, item)
-            paths.append(markdown.export_page(conn, item))
-    conn.execute("DELETE FROM touched")
-    conn.execute("COMMIT")
-    return paths
-
-
-def derive_all(conn: sqlite3.Connection) -> None:
-    """Mark every page and saved table for re-derivation and export."""
-    conn.execute("INSERT OR IGNORE INTO touched SELECT id FROM pages")
-    conn.execute("INSERT OR IGNORE INTO touched VALUES ('questions'), ('queries')")
-
-
-def sync_blobs(conn: sqlite3.Connection) -> None:
-    """Mirror the blob directory into the blobs table."""
-    root = config.blobs_root()
-    on_disk = {f.name: f.stat().st_size for f in root.iterdir() if f.is_file() and not f.name.startswith(".")} \
-        if root.is_dir() else {}
-    known = {r["name"]: r["size"] for r in conn.execute("SELECT name, size FROM blobs")}
-    if on_disk == known:
-        return
-    conn.execute("BEGIN IMMEDIATE")
-    conn.execute("INSERT OR REPLACE INTO meta VALUES ('syncing-blobs', '1')")  # the delete triggers stand down
-    conn.execute("DELETE FROM blobs")
-    conn.executemany("INSERT INTO blobs VALUES (?, ?)", list(on_disk.items()))
-    conn.execute("DELETE FROM meta WHERE key = 'syncing-blobs'")
-    conn.execute("COMMIT")
-
-
-def sync_documents(conn: sqlite3.Connection) -> int:
-    """Index the documents tree (read-only material): rows, chunks and embeddings."""
-    drop = config.DOCS_ROOT / config.DROP_REL
-    entries: dict[str, tuple[float, int]] = {}
-    files: dict[str, Path] = {}
-    for p in documents.walk(config.DOCS_ROOT):
-        if drop in p.parents or p.suffix.lower() in documents.HTML:
-            continue
-        st, item_id = p.stat(), f"doc:{documents.relative(p)}"
-        entries[item_id], files[item_id] = (st.st_mtime, st.st_size), p
-    known = {r["id"]: (r["mtime"], r["size"]) for r in conn.execute("SELECT id, mtime, size FROM documents")}
-    changed = [i for i, stat in entries.items() if known.get(i) != stat]
-    gone = [i for i in known if i not in entries]
-    for item_id in changed:
-        p, rel = files[item_id], item_id.removeprefix("doc:")
-        sha = documents.sha256_of(p)
-        text = documents.text_for(p, sha)
-        conn.execute("BEGIN IMMEDIATE")
-        conn.execute("INSERT OR REPLACE INTO documents VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)", (
-            item_id, rel, rel.split("/")[0], p.name, documents.media_of(p), documents.mime_of(p),
-            entries[item_id][1], sha, entries[item_id][0]))
-        _set_chunks(conn, item_id, p.name, [(item_id, t) for t in split(text or "", 60)] or [(item_id, rel)])
-        conn.execute("COMMIT")
-    if gone:
-        conn.execute("BEGIN IMMEDIATE")
-        for item_id in gone:
-            conn.execute("DELETE FROM documents WHERE id = ?", (item_id,))
-            _set_chunks(conn, item_id, "", [])
-        conn.execute("COMMIT")
-    return len(changed) + len(gone)
-
-
-def check_model(conn: sqlite3.Connection) -> None:
-    """Vectors from another model cannot be compared: forget them all when the model changes."""
-    row = conn.execute("SELECT value FROM meta WHERE key = 'embed_model'").fetchone()
-    if row and row[0] == embed.model_id():
-        return
-    conn.execute("BEGIN IMMEDIATE")
-    conn.execute("INSERT OR REPLACE INTO meta VALUES ('embed_model', ?)", (embed.model_id(),))
-    conn.execute("UPDATE chunks SET embedding = NULL")
-    conn.execute("COMMIT")
-
-
-def embed_backlog(conn: sqlite3.Connection, seconds: float = 20.0) -> int:
-    """Give vectors to chunks that have none yet (new or changed text), for about `seconds`; the worker's job.
-    Search works meanwhile: such chunks are found by keyword only."""
-    deadline, done = time.monotonic() + seconds, 0
-    while time.monotonic() < deadline:
-        rows = conn.execute("SELECT id, page, title, text FROM chunks WHERE embedding IS NULL "
-                            "ORDER BY (page LIKE 'doc:%'), id LIMIT 8").fetchall()
-        if not rows:
-            break
-        vectors = [(embed.passage(r["title"], r["text"]), r["id"], r["page"], r["title"], r["text"])
-                   for r in rows]  # computed outside any lock; a concurrent write may replace these chunks
-        conn.execute("BEGIN IMMEDIATE")
-        conn.executemany("UPDATE chunks SET embedding = ? WHERE id = ? AND page = ? AND title IS ? "
-                         "AND text = ? AND embedding IS NULL", vectors)
-        conn.execute("COMMIT")
-        done += len(rows)
-    return done
-
-
-# --- writing ---------------------------------------------------------------------------
-
-def _write_auth():
-    """One authorizer per statement: file metadata changes only through a page's FK cascade."""
-    target = None
-
-    def authorize(action: int, arg1, arg2, db, source) -> int:
-        nonlocal target
-        if action in _READ:
-            return sqlite3.SQLITE_OK
-        if action in (sqlite3.SQLITE_INSERT, sqlite3.SQLITE_UPDATE, sqlite3.SQLITE_DELETE):
-            if source is not None:  # a trigger doing the bookkeeping
-                return sqlite3.SQLITE_OK
-            if target is None:
-                target = arg1
-            if arg1 in WRITABLE and (arg1 != "blobs" or action == sqlite3.SQLITE_DELETE):
-                return sqlite3.SQLITE_OK
-            if arg1 == "files" and target == "pages" and action != sqlite3.SQLITE_INSERT:
-                return sqlite3.SQLITE_OK
-        return sqlite3.SQLITE_DENY
-
-    return authorize
-
-
-def _friendly(e: Exception) -> str:
-    text = str(e)
-    if "FOREIGN KEY" in text:
-        return "FOREIGN KEY constraint failed: facts.subject must be the id of an existing page"
-    if "not authorized" in text:
-        return ("not allowed: write takes INSERT, UPDATE and DELETE on pages, facts, questions and queries "
-                "(files come in through upload; DELETE FROM blobs removes an unused file)")
-    return text
-
-
-def apply(statements: list[tuple[str, list | dict | None, bool]], actor: str, message: str,
-          key: str | None = None, author: str = "vault") -> dict:
-    """Run (sql, params, many) statements as one transaction, then export and commit what they touched.
-    Returns {"commit", "changed", "rows", "replayed"}. Raises ValueError with a message meant for the agent."""
-    with repo.locked(), connect() as conn:
-        if key and (done := conn.execute("SELECT sha, changed FROM log WHERE key = ?", (key,)).fetchone()):
-            return {"commit": done["sha"], "changed": json.loads(done["changed"]), "rows": 0, "replayed": True}
-        rows = 0
-        conn.execute("BEGIN IMMEDIATE")
-        try:
-            for sql, params, many in statements:
-                conn.set_authorizer(_write_auth())
-                cur = conn.execute(sql, params or [])
-                if cur.description is not None:
-                    cur.close()
-                    raise ValueError("write takes INSERT, UPDATE and DELETE without RETURNING; use sql to read")
-                changed_rows = conn.execute("SELECT changes()").fetchone()[0]
-                if changed_rows > MANY and not many:
-                    raise ValueError(f"this statement would change {changed_rows} rows; narrow its WHERE, or pass "
-                                      f"many=true if that is what you mean: {sql[:80]}")
-                rows += changed_rows
-        except (sqlite3.Error, ValueError) as e:
-            conn.set_authorizer(None)
-            conn.execute("ROLLBACK")
-            raise ValueError(_friendly(e)) from None
-        conn.set_authorizer(None)
-        changed = [r[0] for r in conn.execute("SELECT id FROM touched ORDER BY id")]
-        cur = conn.execute("INSERT INTO log (actor, message, changed, key) VALUES (?, ?, ?, ?)",
-                           (actor, message, json.dumps(changed), key))
-        conn.execute("COMMIT")
-        sha = publish(conn, f"{message} ({actor})", author)
-        conn.execute("UPDATE log SET sha = ? WHERE id = ?", (sha, cur.lastrowid))
-        return {"commit": sha, "changed": changed, "rows": rows, "replayed": False}
-
-
-def publish(conn: sqlite3.Connection, message: str, author: str = "vault") -> str:
-    """Drain what is touched into the export and commit it. Call inside repo.locked()."""
-    paths = drain(conn)
-    return repo.commit(paths, message, author) if paths else "no changes"
-
-
-# --- reading ---------------------------------------------------------------------------
-
-def encode_cursor(offset: int) -> str:
-    return base64.urlsafe_b64encode(json.dumps({"o": offset}).encode()).decode()
-
-
-def decode_cursor(cursor: str | None) -> int:
-    if not cursor:
-        return 0
-    try:
-        offset = json.loads(base64.urlsafe_b64decode(cursor.encode()))["o"]
-        if type(offset) is not int or offset < 0:
-            raise ValueError
-        return offset
-    except (ValueError, KeyError, TypeError):
-        raise ValueError("invalid cursor; start again without one") from None
-
-
-STOPWORDS = set("a an and are as at be by did do does for from had has have how i in is it me my of on or our that the "
-                "their this to was we were what when where which who whom whose why will with you your".split())
-
-
-def fts_query(text: str) -> str:
-    """Any of the words (as prefixes) or "quoted phrases"; BM25 ranks rows with more of them first.
-    Question words and other fillers are left out when anything else remains: meaning ranks those."""
-    phrases = [p.replace('"', "") for p in re.findall(r'"([^"]+)"', text)]
-    words = re.findall(r"\w+", re.sub(r'"[^"]*"', " ", text))
-    content = [w for w in words if w.lower() not in STOPWORDS]
-    return " OR ".join([f'"{p}"' for p in phrases] + [f'"{w}"*' for w in (content or words)])
-
-
-def search(conn: sqlite3.Connection, query: str, limit: int, offset: int = 0) -> tuple[list[dict], bool]:
-    """Hybrid search over chunks: keyword rank (BM25) and meaning rank (cosine) fused by reciprocal rank.
-    Returns the best chunk per ref (a page, one of its facts, or a document)."""
-    expr = fts_query(query)
-    if not expr:
-        raise ValueError("search needs at least one word")
-    pool = max(50, 4 * (limit + offset))
-    keyword = [r[0] for r in conn.execute(
-        "SELECT rowid FROM fts WHERE fts MATCH ? ORDER BY bm25(fts, 4.0, 1.0) LIMIT ?", (expr, pool))]
-    try:
-        vector = embed.query(query)
-    except Exception:  # no model (first start without network): keywords alone still answer
-        log.exception("embedding the query failed; searching by keyword only")
-        vector = None
-    meaning = embed.nearest(vector, conn.execute(
-        "SELECT id, embedding FROM chunks WHERE embedding IS NOT NULL").fetchall(), pool)
-    score: dict[int, float] = {}
-    for ranking in (keyword, meaning):
-        for rank, chunk in enumerate(ranking):
-            score[chunk] = score.get(chunk, 0.0) + 1.0 / (60 + rank)
-    if not score:
-        return [], False
-    candidates = {r["id"]: r for r in conn.execute(
-        "SELECT c.id,c.ref,c.title,c.text,f.valid_from,f.valid_until,f.confirmed,f.source,f.note "
-        "FROM json_each(?) ids JOIN chunks c ON c.id=ids.value "
-        "LEFT JOIN facts f ON f.subject=c.page AND c.ref=f.subject || '#fact-' || f.id",
-        (json.dumps(list(score)),))}
-    best: dict[str, dict] = {}
-    for chunk in sorted(score, key=score.get, reverse=True):
-        row = candidates.get(chunk)
-        if row and row["ref"] not in best:
-            fact = {k: row[k] for k in ("valid_from", "valid_until", "confirmed", "source", "note")} \
-                if row["valid_from"] is not None else None
-            best[row["ref"]] = {"id": row["ref"], "title": row["title"], "text": row["text"],
-                                "fact": fact}
-    found = list(best.values())
-    return found[offset:offset + limit], len(found) > offset + limit
-
-
-def suggest(conn: sqlite3.Connection, wanted: str, limit: int = 3) -> list[str]:
-    """Page ids that share a word with `wanted` (for "did you mean" on a miss)."""
-    words = [w for w in re.findall(r"[A-Za-z0-9]+", wanted.split(":", 1)[-1]) if len(w) > 1]
-    if not words:
-        return []
-    where = " OR ".join("id LIKE ?" for _ in words)
-    rows = conn.execute(f"SELECT id FROM pages WHERE {where} ORDER BY length(id) LIMIT ?",
-                        [f"%{w}%" for w in words] + [limit])
-    return [r[0] for r in rows]
-
-
-_READ = {sqlite3.SQLITE_SELECT, sqlite3.SQLITE_READ, sqlite3.SQLITE_FUNCTION, sqlite3.SQLITE_RECURSIVE}
-_PRAGMAS = {"table_info", "table_xinfo", "index_list", "index_info", "data_version"}  # FTS5 reads data_version
 CELL_MAX = 2000
-RESULT_MAX = 100_000  # characters across all returned cells
+RESULT_MAX = 100_000
+ROW_LIMIT_MAX = 100
+
+SQL_DIR = Path(__file__).resolve().parent / "sql"
+MIGRATIONS_DIR = SQL_DIR / "migrations"
+VEC_SCHEMA_PATH = SQL_DIR / "vectors.sql"
+BUILTIN_VIEWS_DIR = SQL_DIR / "views"
+
+_ALLOW_ACTIONS = {
+    sqlite3.SQLITE_SELECT,
+    sqlite3.SQLITE_READ,
+    sqlite3.SQLITE_INSERT,
+    sqlite3.SQLITE_UPDATE,
+    sqlite3.SQLITE_DELETE,
+    sqlite3.SQLITE_FUNCTION,
+    sqlite3.SQLITE_RECURSIVE,
+    sqlite3.SQLITE_TRANSACTION,
+}
+_WRITE_ACTIONS = {sqlite3.SQLITE_INSERT, sqlite3.SQLITE_UPDATE, sqlite3.SQLITE_DELETE}
+_SAFE_PRAGMAS = {"table_info", "table_xinfo", "index_list", "index_info", "data_version", "foreign_keys"}
+_ATTACH_RELS = ("requires", "contradicts", "part_of", "relates")
+_OPAQUE_DELIM_RE = re.compile(r"\b[A-Za-z0-9]+(?:[-_./:][A-Za-z0-9]+)+\b")
+_OPAQUE_ALNUM_RE = re.compile(r"\b(?=[A-Za-z0-9]*[0-9])(?=[A-Za-z0-9]*[A-Za-z])[A-Za-z0-9]{4,}\b")
+_VEC_SYNC_LOCK = threading.Lock()
 
 
-def _read_auth(action: int, arg1, arg2, db, source) -> int:
-    if action in _READ or (action == sqlite3.SQLITE_PRAGMA and arg1 in _PRAGMAS):
+def _authorizer(action: int, arg1: Any, arg2: Any, db_name: Any, source: Any) -> int:
+    if action in _ALLOW_ACTIONS:
+        if action in _WRITE_ACTIONS and (
+            db_name == "vec" or arg1 in ("sqlite_schema", "sqlite_master")
+        ):
+            return sqlite3.SQLITE_DENY
+        return sqlite3.SQLITE_OK
+    if action == sqlite3.SQLITE_PRAGMA and arg1 in _SAFE_PRAGMAS:
         return sqlite3.SQLITE_OK
     return sqlite3.SQLITE_DENY
 
 
-def _cell(value):
-    if isinstance(value, bytes):
+def register_functions(conn: sqlite3.Connection) -> None:
+    """Register `embed(text)` and `cosine(a, b)` UDFs on the SQLite connection."""
+    conn.create_function("embed", 1, embed.query, deterministic=True)
+    conn.create_function("cosine", 2, embed.cosine, deterministic=True)
+
+
+def _configure_conn(conn: sqlite3.Connection) -> None:
+    conn.row_factory = sqlite3.Row
+    conn.execute("PRAGMA journal_mode = WAL")
+    conn.execute("PRAGMA synchronous = NORMAL")
+    conn.execute("PRAGMA busy_timeout = 5000")
+    conn.execute("PRAGMA foreign_keys = ON")
+    conn.execute("PRAGMA temp_store = MEMORY")
+    conn.execute("PRAGMA cache_size = -16000")
+
+
+def connect(
+    db_path: Path | str | None = None,
+    *,
+    vec_db_path: Path | str | None = None,
+    attach_vectors: bool = False,
+) -> sqlite3.Connection:
+    """Open WAL connection with foreign_keys=ON, busy_timeout=5000, and vector UDFs."""
+    target = Path(db_path) if db_path is not None else config.DB_PATH
+    conn = sqlite3.connect(str(target), timeout=5.0, isolation_level=None)
+    _configure_conn(conn)
+    register_functions(conn)
+    if attach_vectors:
+        vpath = config.vec_db_path(target) if vec_db_path is None else Path(vec_db_path)
+        if vpath.exists():
+            conn.execute("ATTACH DATABASE ? AS vec", (str(vpath),))
+    return conn
+
+
+def apply_migrations(conn: sqlite3.Connection, migrations_dir: Path | None = None) -> int:
+    """Apply numbered forward-only SQL migrations (`001-*.sql`, ...) tracked by PRAGMA user_version."""
+    mdir = migrations_dir or MIGRATIONS_DIR
+    current = int(conn.execute("PRAGMA user_version").fetchone()[0])
+    files = sorted(p for p in mdir.glob("[0-9][0-9][0-9]-*.sql") if p.is_file())
+    for path in files:
+        ver = int(path.name.split("-", 1)[0])
+        if ver <= current:
+            continue
+        sql_text = path.read_text(encoding="utf-8")
+        conn.execute("PRAGMA foreign_keys = ON")
+        try:
+            conn.executescript(f"BEGIN;\n{sql_text}\nPRAGMA user_version = {ver};\nCOMMIT;")
+        except Exception:
+            if conn.in_transaction:
+                conn.execute("ROLLBACK")
+            raise
+        conn.execute("PRAGMA foreign_keys = ON")
+        current = ver
+    return current
+
+
+def _apply_view_dir(conn: sqlite3.Connection, vdir: Path) -> None:
+    if not vdir.is_dir():
+        return
+    for sql_file in sorted(vdir.glob("*.sql")):
+        conn.executescript(sql_file.read_text(encoding="utf-8"))
+
+
+def reload_views(db_path: Path | str | None = None, views_dir: Path | None = None) -> None:
+    """Reload packaged SQL views and overlay userspace views from `$VAULT_ROOT/usr/views/*.sql`."""
+    target = Path(db_path) if db_path is not None else config.DB_PATH
+    vdir = views_dir if views_dir is not None else config.VIEWS_DIR
+    with contextlib.closing(connect(target)) as conn:
+        _apply_view_dir(conn, BUILTIN_VIEWS_DIR)
+        if vdir.resolve() != BUILTIN_VIEWS_DIR.resolve():
+            _apply_view_dir(conn, vdir)
+        conn.execute("PRAGMA foreign_keys = ON")
+
+
+def init_db(
+    db_path: Path | str | None = None,
+    *,
+    migrations_dir: Path | None = None,
+    views_dir: Path | None = None,
+    vec_db_path: Path | str | None = None,
+    vec_schema_path: Path | None = None,
+) -> int:
+    """Initialize canonical vault.db migrations + views and rebuildable vectors.db."""
+    db_file = Path(db_path) if db_path is not None else config.DB_PATH
+    db_file.parent.mkdir(parents=True, exist_ok=True)
+    with contextlib.closing(connect(db_file)) as conn:
+        version = apply_migrations(conn, migrations_dir=migrations_dir)
+    reload_views(db_file, views_dir=views_dir)
+
+    vpath = config.vec_db_path(db_path) if vec_db_path is None else Path(vec_db_path)
+    vpath.parent.mkdir(parents=True, exist_ok=True)
+    vec_schema = (vec_schema_path or VEC_SCHEMA_PATH).read_text(encoding="utf-8")
+    with contextlib.closing(sqlite3.connect(str(vpath), timeout=5.0, isolation_level=None)) as vc:
+        vc.execute("PRAGMA journal_mode = WAL")
+        vc.execute("PRAGMA synchronous = NORMAL")
+        vc.execute("PRAGMA busy_timeout = 5000")
+        vc.executescript(vec_schema)
+    return version
+
+
+def schema_text() -> str:
+    """Return canonical DDL across migrations and vectors schema."""
+    parts = [p.read_text(encoding="utf-8") for p in sorted(MIGRATIONS_DIR.glob("[0-9][0-9][0-9]-*.sql"))]
+    parts.append(VEC_SCHEMA_PATH.read_text(encoding="utf-8"))
+    return "\n\n".join(parts)
+
+
+def views_text(db_path: Path | str | None = None) -> str:
+    """Return currently active SQL view definitions from vault.db."""
+    with contextlib.closing(connect(db_path)) as conn:
+        rows = conn.execute(
+            "SELECT name, sql FROM sqlite_master WHERE type = 'view' ORDER BY name"
+        ).fetchall()
+    return "\n\n".join(f"-- {r['name']}\n{r['sql']};" for r in rows if r["sql"])
+
+
+def _content_digest(parts: tuple[str, ...]) -> bytes:
+    h = hashlib.blake2b(digest_size=16)
+    for part in parts:
+        h.update(part.encode("utf-8"))
+        h.update(b"\x00")
+    return h.digest()
+
+
+def _sync_vectors_conn(conn: sqlite3.Connection, vec_conn: sqlite3.Connection) -> int:
+    """Delta-sync int8 embeddings in `vec_conn` from `conn` using blake2b content_hash."""
+    model = embed.model_id()
+    written = 0
+
+    existing_items = {
+        r["item_id"]: (r["model"], bytes(r["content_hash"]))
+        for r in vec_conn.execute("SELECT item_id, model, content_hash FROM items_vec").fetchall()
+    }
+    live_items = conn.execute("SELECT id, kind, title, body FROM items").fetchall()
+    live_item_ids: set[str] = set()
+    dirty_items: list[tuple[str, bytes, bytes]] = []
+
+    for r in live_items:
+        iid = r["id"]
+        live_item_ids.add(iid)
+        digest = _content_digest((r["kind"], r["title"], r["body"]))
+        if existing_items.get(iid) != (model, digest):
+            blob = embed.passage_int8(f"{r['kind']} {r['title']}", r["body"])
+            dirty_items.append((iid, digest, blob))
+
+    stale_items = [iid for iid in existing_items if iid not in live_item_ids]
+
+    existing_eps = {
+        r["episode_id"]: (r["model"], bytes(r["content_hash"]))
+        for r in vec_conn.execute("SELECT episode_id, model, content_hash FROM episodes_vec").fetchall()
+    }
+    live_eps = conn.execute("SELECT id, source, kind, context, detail FROM episodes").fetchall()
+    live_ep_ids: set[int] = set()
+    dirty_eps: list[tuple[int, bytes, bytes]] = []
+
+    for r in live_eps:
+        eid = int(r["id"])
+        live_ep_ids.add(eid)
+        digest = _content_digest((r["source"], r["kind"], r["context"], r["detail"]))
+        if existing_eps.get(eid) != (model, digest):
+            blob = embed.passage_int8(f"{r['source']} {r['kind']} {r['context']}", r["detail"])
+            dirty_eps.append((eid, digest, blob))
+
+    stale_eps = [eid for eid in existing_eps if eid not in live_ep_ids]
+
+    if stale_items or dirty_items or stale_eps or dirty_eps:
+        vec_conn.execute("BEGIN")
+        try:
+            if stale_items:
+                vec_conn.executemany("DELETE FROM items_vec WHERE item_id = ?", [(i,) for i in stale_items])
+                written += len(stale_items)
+            if dirty_items:
+                vec_conn.executemany(
+                    """
+                    INSERT INTO items_vec(item_id, model, content_hash, embedding)
+                    VALUES (?, ?, ?, ?)
+                    ON CONFLICT(item_id) DO UPDATE SET
+                      model = excluded.model,
+                      content_hash = excluded.content_hash,
+                      embedding = excluded.embedding
+                    """,
+                    [(iid, model, digest, blob) for iid, digest, blob in dirty_items],
+                )
+                written += len(dirty_items)
+            if stale_eps:
+                vec_conn.executemany("DELETE FROM episodes_vec WHERE episode_id = ?", [(e,) for e in stale_eps])
+                written += len(stale_eps)
+            if dirty_eps:
+                vec_conn.executemany(
+                    """
+                    INSERT INTO episodes_vec(episode_id, model, content_hash, embedding)
+                    VALUES (?, ?, ?, ?)
+                    ON CONFLICT(episode_id) DO UPDATE SET
+                      model = excluded.model,
+                      content_hash = excluded.content_hash,
+                      embedding = excluded.embedding
+                    """,
+                    [(eid, model, digest, blob) for eid, digest, blob in dirty_eps],
+                )
+                written += len(dirty_eps)
+            vec_conn.execute("COMMIT")
+        except Exception:
+            if vec_conn.in_transaction:
+                vec_conn.execute("ROLLBACK")
+            raise
+    return written
+
+
+def sync_vectors(db_path: Path | str | None = None, vec_db_path: Path | str | None = None) -> int:
+    """Delta-sync `vectors.db` (`items_vec` & `episodes_vec`) against `vault.db`."""
+    target = Path(db_path) if db_path is not None else config.DB_PATH
+    vpath = config.vec_db_path(db_path) if vec_db_path is None else Path(vec_db_path)
+    with _VEC_SYNC_LOCK:
+        if not vpath.exists():
+            vec_schema = VEC_SCHEMA_PATH.read_text(encoding="utf-8")
+            vpath.parent.mkdir(parents=True, exist_ok=True)
+            with contextlib.closing(sqlite3.connect(str(vpath), timeout=5.0, isolation_level=None)) as vc:
+                vc.execute("PRAGMA journal_mode = WAL")
+                vc.executescript(vec_schema)
+        with (
+            contextlib.closing(connect(target)) as conn,
+            contextlib.closing(sqlite3.connect(str(vpath), timeout=5.0, isolation_level=None)) as vec_conn,
+        ):
+            vec_conn.row_factory = sqlite3.Row
+            vec_conn.execute("PRAGMA journal_mode = WAL")
+            vec_conn.execute("PRAGMA synchronous = NORMAL")
+            vec_conn.execute("PRAGMA busy_timeout = 5000")
+            return _sync_vectors_conn(conn, vec_conn)
+
+
+def rebuild_vectors(
+    db_path: Path | str | None = None,
+    vec_db_path: Path | str | None = None,
+    *,
+    vec_schema_path: Path | None = None,
+) -> int:
+    """Drop and recreate rebuildable `vectors.db` completely from canonical `vault.db`."""
+    target = Path(db_path) if db_path is not None else config.DB_PATH
+    vpath = config.vec_db_path(db_path) if vec_db_path is None else Path(vec_db_path)
+    vpath.parent.mkdir(parents=True, exist_ok=True)
+    vec_schema = (vec_schema_path or VEC_SCHEMA_PATH).read_text(encoding="utf-8")
+    with _VEC_SYNC_LOCK:
+        with (
+            contextlib.closing(connect(target)) as conn,
+            contextlib.closing(sqlite3.connect(str(vpath), timeout=5.0, isolation_level=None)) as vec_conn,
+        ):
+            vec_conn.row_factory = sqlite3.Row
+            vec_conn.execute("PRAGMA journal_mode = WAL")
+            vec_conn.execute("PRAGMA synchronous = NORMAL")
+            vec_conn.execute("PRAGMA busy_timeout = 5000")
+            vec_conn.executescript(
+                "DROP TABLE IF EXISTS items_vec; DROP TABLE IF EXISTS episodes_vec;\n" + vec_schema
+            )
+            return _sync_vectors_conn(conn, vec_conn)
+
+
+def rebuild_cli() -> None:
+    """CLI entrypoint (`vault-rebuild-vectors`) for rebuilding `vectors.db`."""
+    init_db()
+    count = rebuild_vectors()
+    print(f"rebuilt vectors.db: {count} rows encoded ({embed.model_id()})")
+
+
+def _encode_cursor(offset: int) -> str:
+    return base64.urlsafe_b64encode(str(offset).encode("ascii")).decode("ascii")
+
+
+def _decode_cursor(cursor: str | None) -> int:
+    if not cursor:
+        return 0
+    try:
+        return max(0, int(base64.urlsafe_b64decode(cursor.encode("ascii")).decode("ascii")))
+    except Exception as err:
+        raise ValueError("invalid pagination cursor") from err
+
+
+def _clip_cell(value: Any) -> Any:
+    if isinstance(value, (bytes, bytearray, memoryview)):
         return f"<{len(value)} bytes>"
     if isinstance(value, str) and len(value) > CELL_MAX:
-        return value[:CELL_MAX] + f"… [{len(value) - CELL_MAX} more characters; select substr(...) to read on]"
+        return value[:CELL_MAX] + f"... [{len(value) - CELL_MAX} more chars]"
     return value
 
 
-def run_sql(sql: str, params: list | dict | None, limit: int, offset: int) -> tuple[list[str], list[dict], bool]:
-    """(columns, rows as dicts, more rows exist). Raises ValueError with a message meant for the agent."""
-    with connect():  # make sure the database exists
-        pass
-    conn = sqlite3.connect(config.DB_PATH.resolve().as_uri() + "?mode=ro", uri=True, timeout=5, isolation_level=None)
-    try:
-        conn.execute("PRAGMA query_only = 1")
-        _functions(conn)
-        conn.set_authorizer(_read_auth)
+def run_sql(
+    db_path: Path | str | None,
+    query: str,
+    params: list[Any] | dict[str, Any] | None = None,
+    limit: int = ROW_LIMIT_MAX,
+    cursor: str | None = None,
+    *,
+    vec_db_path: Path | str | None = None,
+) -> dict[str, Any]:
+    """Execute one SQL statement with timeout, authorizer (vec read-only), 100-row cap, and delta sync."""
+    target = Path(db_path) if db_path is not None else config.DB_PATH
+    vpath = config.vec_db_path(db_path) if vec_db_path is None else Path(vec_db_path)
+    offset = _decode_cursor(cursor)
+    cap = max(1, min(limit, ROW_LIMIT_MAX))
+
+    with contextlib.closing(connect(target, vec_db_path=vpath, attach_vectors=True)) as conn:
+        before_changes = conn.total_changes
+        conn.set_authorizer(_authorizer)
         deadline = time.monotonic() + config.SQL_TIMEOUT_SECONDS
         conn.set_progress_handler(lambda: time.monotonic() > deadline, 10_000)
+
         try:
-            cur = conn.execute(sql, params or [])
-            if cur.description is None:
-                raise ValueError("only queries (SELECT, WITH) are allowed here; change rows with `write`")
-            columns = [d[0] for d in cur.description]
-            for _ in range(offset):
-                if cur.fetchone() is None:
-                    break
-            rows, size = [], 0
-            for raw in cur.fetchmany(limit + 1):
-                row = {c: _cell(v) for c, v in zip(columns, raw, strict=True)}
-                size += sum(len(str(v)) for v in row.values())
-                if len(rows) == limit or (rows and size > RESULT_MAX):
-                    return columns, rows, True
-                rows.append(row)
-            return columns, rows, False
-        except sqlite3.OperationalError as e:
-            if "interrupted" in str(e):
-                raise ValueError(f"query ran longer than {config.SQL_TIMEOUT_SECONDS:g}s; narrow it") from None
-            if "not authorized" in str(e):
-                raise ValueError("not allowed: `sql` is read-only (one SELECT or WITH); change rows with `write`") \
-                    from None
-            raise ValueError(f"SQL error: {e}") from None
-        except (sqlite3.ProgrammingError, sqlite3.DatabaseError) as e:
-            if "not authorized" in str(e):
-                raise ValueError("not allowed: `sql` is read-only (one SELECT or WITH); change rows with `write`") \
-                    from None
-            raise ValueError(f"SQL error: {e}") from None
-    finally:
-        conn.close()
+            cur = conn.execute(query, params if params is not None else [])
+        except sqlite3.OperationalError as err:
+            msg = str(err)
+            if "interrupted" in msg:
+                raise ValueError(f"query timed out after {config.SQL_TIMEOUT_SECONDS:g}s") from None
+            if "not authorized" in msg or "authorization denied" in msg:
+                raise ValueError(f"SQL operation not permitted: {msg}") from None
+            raise ValueError(f"SQL error: {msg}") from None
+        except (sqlite3.IntegrityError, sqlite3.ProgrammingError, sqlite3.DatabaseError) as err:
+            raise ValueError(f"SQL error: {err}") from None
+        finally:
+            conn.set_progress_handler(None, 0)
+            conn.set_authorizer(None)
+
+        if cur.description is None:
+            changed = conn.total_changes - before_changes
+            rows_affected = cur.rowcount if cur.rowcount >= 0 else changed
+            cur.close()
+            vec_synced = 0
+            if changed > 0:
+                if vpath.exists():
+                    conn.execute("DETACH DATABASE vec")
+                vec_synced = sync_vectors(target, vec_db_path=vpath)
+            return {
+                "columns": [],
+                "rows": [],
+                "rows_affected": rows_affected,
+                "vectors_synced": vec_synced,
+                "truncated": False,
+                "next_cursor": None,
+            }
+
+        columns = [d[0] for d in cur.description]
+        for _ in range(offset):
+            if cur.fetchone() is None:
+                break
+
+        rows: list[dict[str, Any]] = []
+        total_chars = 0
+        more = False
+        for raw in cur.fetchmany(cap + 1):
+            row = {col: _clip_cell(val) for col, val in zip(columns, raw, strict=True)}
+            row_chars = sum(len(str(v)) for v in row.values())
+            if len(rows) == cap or (rows and total_chars + row_chars > RESULT_MAX):
+                more = True
+                break
+            rows.append(row)
+            total_chars += row_chars
+
+        changed = conn.total_changes - before_changes
+        cur.close()
+        if changed > 0:
+            if vpath.exists():
+                conn.execute("DETACH DATABASE vec")
+            sync_vectors(target, vec_db_path=vpath)
+
+        return {
+            "columns": columns,
+            "rows": rows,
+            "truncated": more,
+            "next_cursor": _encode_cursor(offset + len(rows)) if more else None,
+        }
+
+
+def _estimate_tokens(obj: Any) -> int:
+    return max(1, len(json.dumps(obj, ensure_ascii=True)) // 4)
+
+
+def _opaque_tokens(query_text: str) -> list[str]:
+    seen: list[str] = []
+    for rx in (_OPAQUE_DELIM_RE, _OPAQUE_ALNUM_RE):
+        for tok in rx.findall(query_text):
+            if tok not in seen:
+                seen.append(tok)
+    return seen
+
+
+def _like_pattern(token: str) -> str:
+    escaped = token.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
+    return f"%{escaped}%"
+
+
+def recall(
+    db_path: Path | str | None,
+    query_text: str,
+    budget: int = 1800,
+    k: int = 6,
+    *,
+    vec_db_path: Path | str | None = None,
+) -> dict[str, Any]:
+    """Hybrid int8 retrieval across items_vec + episodes_vec, exact/LIKE fallback, and 1-hop attach."""
+    if not query_text or not query_text.strip():
+        raise ValueError("query must not be empty")
+    budget = max(200, int(budget))
+    k = max(1, min(int(k), 25))
+    target = Path(db_path) if db_path is not None else config.DB_PATH
+    vpath = config.vec_db_path(db_path) if vec_db_path is None else Path(vec_db_path)
+
+    q_vec = embed.query(query_text)
+    terms = set(re.findall(r"[a-z0-9]+", query_text.lower()))
+    opaque = _opaque_tokens(query_text)
+
+    with contextlib.closing(connect(target)) as conn:
+        active_rows = conn.execute(
+            "SELECT id, kind, title, body FROM items WHERE status = 'active'"
+        ).fetchall()
+
+        if vpath.exists():
+            with contextlib.closing(sqlite3.connect(str(vpath), timeout=5.0, isolation_level=None)) as vc:
+                vc.row_factory = sqlite3.Row
+                item_vec_rows = [
+                    (r["item_id"], r["embedding"])
+                    for r in vc.execute("SELECT item_id, embedding FROM items_vec").fetchall()
+                ]
+                ep_vec_rows = [
+                    (r["episode_id"], r["embedding"])
+                    for r in vc.execute("SELECT episode_id, embedding FROM episodes_vec").fetchall()
+                ]
+        else:
+            item_vec_rows = []
+            ep_vec_rows = []
+
+        item_vec_scores = dict(embed.nearest_int8(q_vec, item_vec_rows, len(item_vec_rows)))
+        ep_vec_hits = [
+            (int(eid), sim)
+            for eid, sim in embed.nearest_int8(q_vec, ep_vec_rows, max(4, k))
+            if sim >= 0.45
+        ]
+
+        item_like_hits: set[str] = set()
+        ep_like_hits: list[int] = []
+        for tok in opaque:
+            pat = _like_pattern(tok)
+            for r in conn.execute(
+                """
+                SELECT id FROM items
+                WHERE status = 'active' AND (body LIKE ? ESCAPE '\\' OR title LIKE ? ESCAPE '\\')
+                """,
+                (pat, pat),
+            ).fetchall():
+                item_like_hits.add(r["id"])
+            for r in conn.execute(
+                """
+                SELECT id FROM episodes
+                WHERE context LIKE ? ESCAPE '\\' OR detail LIKE ? ESCAPE '\\'
+                ORDER BY id DESC LIMIT 6
+                """,
+                (pat, pat),
+            ).fetchall():
+                eid = int(r["id"])
+                if eid not in ep_like_hits:
+                    ep_like_hits.append(eid)
+
+        item_meta: dict[str, dict[str, Any]] = {}
+        ranked: list[tuple[float, str, dict[str, float]]] = []
+        for r in active_rows:
+            item_id = r["id"]
+            item_meta[item_id] = {
+                "id": item_id,
+                "kind": r["kind"],
+                "title": r["title"],
+                "body": r["body"],
+            }
+            v_sim = round(max(0.0, item_vec_scores.get(item_id, 0.0)) * 1.65, 4)
+            slug_tokens = set(re.findall(r"[a-z0-9]+", item_id.lower())) | set(
+                re.findall(r"[a-z0-9]+", r["title"].lower())
+            )
+            exact = 0.65 if terms & slug_tokens else 0.0
+            opaque_boost = 2.0 if item_id in item_like_hits else 0.0
+            total = round(v_sim + exact + opaque_boost, 4)
+            ranked.append((total, item_id, {"vec": v_sim, "exact": exact, "opaque": opaque_boost, "total": total}))
+
+        ranked.sort(key=lambda entry: (entry[0], entry[1]), reverse=True)
+        top_items_full: list[dict[str, Any]] = [
+            {**item_meta[item_id], "score": score}
+            for total, item_id, score in ranked[:k]
+            if total > 0.0
+        ]
+        top_set = {it["id"] for it in top_items_full}
+
+        direct_ep_ids: list[int] = list(ep_like_hits)
+        for eid, _ in ep_vec_hits:
+            if eid not in direct_ep_ids:
+                direct_ep_ids.append(eid)
+
+        if direct_ep_ids:
+            ph = ",".join("?" for _ in direct_ep_ids)
+            for b in conn.execute(
+                f"SELECT DISTINCT item_id FROM episode_items WHERE episode_id IN ({ph})",
+                tuple(direct_ep_ids),
+            ).fetchall():
+                iid = b["item_id"]
+                if iid in item_meta and iid not in top_set:
+                    top_set.add(iid)
+                    top_items_full.append(
+                        {
+                            **item_meta[iid],
+                            "via": "episodes_vec",
+                            "score": {"vec": 0.0, "exact": 0.0, "opaque": 0.0, "total": 0.5},
+                        }
+                    )
+
+        attached_links: list[dict[str, Any]] = []
+        attached_ids: set[str] = set()
+        if top_set:
+            ph_ids = ",".join("?" for _ in top_set)
+            ph_rels = ",".join("?" for _ in _ATTACH_RELS)
+            for link in conn.execute(
+                f"""
+                SELECT src, rel, dst, weight
+                FROM links
+                WHERE status = 'active'
+                  AND rel IN ({ph_rels})
+                  AND (src IN ({ph_ids}) OR dst IN ({ph_ids}))
+                ORDER BY weight DESC, src ASC, dst ASC
+                LIMIT 12
+                """,
+                (*_ATTACH_RELS, *tuple(top_set), *tuple(top_set)),
+            ).fetchall():
+                attached_links.append(
+                    {"src": link["src"], "rel": link["rel"], "dst": link["dst"], "weight": float(link["weight"])}
+                )
+                attached_ids.update((link["src"], link["dst"]))
+
+        neighbor_ids = sorted(iid for iid in attached_ids if iid in item_meta and iid not in top_set)
+        attached_items_full = [item_meta[iid] for iid in neighbor_ids]
+
+        due_time_cues = conn.execute("SELECT id, item_id, due_at, action FROM v_due_cues").fetchall()
+        cues_fired = [
+            {
+                "id": c["id"],
+                "trigger_kind": "time",
+                "item_id": c["item_id"],
+                "due_at": c["due_at"],
+                "action": c["action"],
+            }
+            for c in due_time_cues
+        ]
+        cue_targets = top_set | set(neighbor_ids)
+        if cue_targets:
+            ph_cue = ",".join("?" for _ in cue_targets)
+            for c in conn.execute(
+                f"""
+                SELECT id, item_id, on_item_id, action FROM cues
+                WHERE status = 'armed' AND trigger_kind = 'event' AND on_item_id IN ({ph_cue})
+                """,
+                tuple(cue_targets),
+            ).fetchall():
+                cues_fired.append(
+                    {
+                        "id": c["id"],
+                        "trigger_kind": "event",
+                        "item_id": c["item_id"],
+                        "on_item_id": c["on_item_id"],
+                        "action": c["action"],
+                    }
+                )
+
+        episodes_by_id: dict[int, dict[str, Any]] = {}
+        ordered_ep_ids: list[int] = []
+        if direct_ep_ids:
+            ph_ep = ",".join("?" for _ in direct_ep_ids)
+            by_id = {
+                int(r["id"]): dict(r)
+                for r in conn.execute(
+                    f"""
+                    SELECT id, at, kind, source, context, detail, confidence, uri
+                    FROM episodes WHERE id IN ({ph_ep})
+                    """,
+                    tuple(direct_ep_ids),
+                ).fetchall()
+            }
+            for eid in direct_ep_ids:
+                if eid in by_id:
+                    episodes_by_id[eid] = by_id[eid]
+                    ordered_ep_ids.append(eid)
+
+        if top_set:
+            ph_top = ",".join("?" for _ in top_set)
+            for r in conn.execute(
+                f"""
+                SELECT DISTINCT e.id, e.at, e.kind, e.source, e.context, e.detail, e.confidence, e.uri
+                FROM episodes e
+                JOIN episode_items ei ON ei.episode_id = e.id
+                WHERE ei.item_id IN ({ph_top})
+                ORDER BY e.at DESC, e.id DESC
+                LIMIT ?
+                """,
+                (*tuple(top_set), max(3, k)),
+            ).fetchall():
+                eid = int(r["id"])
+                if eid not in episodes_by_id:
+                    episodes_by_id[eid] = dict(r)
+                    ordered_ep_ids.append(eid)
+
+        episodes_full = [episodes_by_id[eid] for eid in ordered_ep_ids]
+
+    packet: dict[str, Any] = {
+        "query": query_text,
+        "cues_fired": cues_fired,
+        "attached_links": attached_links,
+        "items": [],
+        "attached_items": [],
+        "episodes": [],
+    }
+    used = _estimate_tokens(packet)
+    for item in top_items_full:
+        cost = _estimate_tokens(item)
+        if used + cost <= budget or not packet["items"]:
+            packet["items"].append(item)
+            used += cost
+    for item in attached_items_full:
+        cost = _estimate_tokens(item)
+        if used + cost <= budget:
+            packet["attached_items"].append(item)
+            used += cost
+    for ep in episodes_full:
+        cost = _estimate_tokens(ep)
+        if used + cost <= budget:
+            packet["episodes"].append(ep)
+            used += cost
+    packet["approx_tokens"] = used
+    return packet

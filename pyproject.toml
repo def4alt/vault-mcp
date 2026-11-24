@@ -1,7 +1,7 @@
 [project]
 name = "vault-mcp"
-version = "1.2.1"
-description = "MCP server for a SQLite-first personal knowledge vault"
+version = "2.0.0"
+description = "SQLite-first personal memory MCP server"
 readme = "README.md"
 authors = [
     { name = "Andrii Olkhovych", email = "andrii.olkhovych@tum.de" }
@@ -19,8 +19,7 @@ dependencies = [
 
 [project.scripts]
 vault-mcp = "vault_mcp.app.server:main"
-vault-worker = "vault_mcp.worker:main"
-vault-import = "vault_mcp.markdown:main"
+vault-rebuild-vectors = "vault_mcp.store:rebuild_cli"
 
 [build-system]
 requires = ["uv_build>=0.13.7,<0.14.0"]

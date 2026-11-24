@@ -1,117 +1,166 @@
-"""Composition root: the MCP server (tools, auth, middleware) plus the plain HTTP routes for file bytes.
-
-    /mcp              MCP (Streamable HTTP), OAuth routes next to it
-    /u/<ticket>/<n>   PUT an upload (signed link); answers with the file note as JSON
-    /_verify          Caddy's forward_auth check for /f and /d downloads, which Caddy serves from disk
-    /_page            Caddy's forward_auth check on the pages host: which blob /<name>/ shows (pages.py)
-    /_pages           the pages host's index
-    /healthz
-"""
+"""Vault MCP server: sql, recall, and file tools with MultiAuth + Gatekeeper middleware."""
 from __future__ import annotations
 
+import base64
+import contextlib
+import logging
 import threading
-import urllib.parse
-from functools import partial
+from typing import Any
 
 import anyio
 from fastmcp import FastMCP
+from mcp import types as mt
 from prometheus_client import start_http_server
 from starlette.requests import Request
-from starlette.responses import HTMLResponse, JSONResponse, PlainTextResponse, Response
+from starlette.responses import PlainTextResponse
 
-from .. import config, documents, embed, filing, incoming, pages, signing, store
+from .. import config, embed, files, store
 from .auth import Gatekeeper, build_auth
-from .tools import vault
 
-# Clients may only show the first ~500 characters: the essentials come first.
+log = logging.getLogger("vault-server")
+
 INSTRUCTIONS = (
-    "Andrii's knowledge vault: one SQLite database of pages, dated facts about them, a question queue and "
-    "stored files, plus his documents. Read with `search` (keywords and meaning) then `fetch`, or ask anything "
-    "with `sql`. Change rows with `write`: plain INSERT, UPDATE and DELETE statements, one transaction and one "
-    "git commit per call. Add files with `upload`; never put file bytes in tool calls.\n\n"
-    "You are a trusted collaborator working alongside other agents (Claude, ChatGPT, Hermes) in the same vault. "
-    "Start with fetch('notes/current-situation'); conventions are in fetch('AGENTS'), the schema in "
-    "vault://schema. Stored files are attachments: search and fetch return their descriptions, not blob "
-    "contents. For complex analysis, search each facet, follow sources and pagination, and check dates, "
-    "counterevidence and open questions; recipes are in AGENTS and queries. When unsure about a fact, "
-    "add a row to `questions` instead of guessing."
+    "Andrii's personal knowledge vault on zorya. "
+    "The database (`vault.db`) has 6 canonical tables: "
+    "`items(id, kind, title, body, status, props, created_at, updated_at)`, "
+    "`links(src, rel, dst, weight, status, note, updated_at)`, "
+    "`cues(id, trigger_kind, item_id, on_item_id, due_at, action, status, created_at)`, "
+    "`episodes(id, at, kind, source, context, detail, confidence, uri)`, "
+    "`episode_items(episode_id, item_id, role)`, and "
+    "`cursors(name, pos, updated_at)`. "
+    "Built-in views: `v_active_items`, `v_due_cues`, `v_unconsolidated_episodes`, "
+    "`v_cooccurrence`, `v_cooccurrence_window`, `v_concept_state`, `v_review_queue`, `v_study_next`. "
+    "Vector tables in the rebuildable vector database are attached read-only as `vec` "
+    "(`vec.items_vec`, `vec.episodes_vec`) with SQL functions `embed(text)` and `cosine(a, b)`.\n\n"
+    "Tools:\n"
+    "- `recall(query, budget=1800, limit=6)`: retrieve working memory (semantic vector hits, exact/opaque matches, "
+    "1-hop attached neighbors, armed cues, and relevant episodes) within a token budget.\n"
+    "- `sql(query, params?, limit=100, cursor?)`: run one parameterized SQL read or write statement; "
+    "mutating statements delta-sync vector embeddings automatically.\n"
+    "- `file(action, ...)`: manage files under `$VAULT_ROOT` (`read`, `write`, `put_blob`, `delete`).\n\n"
+    "Resources: `vault://schema`, `vault://views`.\n"
+    "Privacy: items with `json_extract(props, '$.private') = 1` are strictly private for helping Andrii directly; "
+    "never quote or summarize them in CVs, emails, work docs, or external outputs."
 )
-STATUS_TEXT = {403: "invalid link\n", 410: "link expired\n"}
+
+vault = FastMCP("vault-tools")
 
 
-async def verify(request: Request) -> Response:
-    """Caddy asks before serving /f/... or /d/... from disk."""
-    if request.headers.get("x-forwarded-method", "GET") not in ("GET", "HEAD"):
-        return Response(status_code=405)
-    uri = request.headers.get("x-forwarded-uri", "")
-    if not uri.startswith(("/f/", "/d/")):
-        return Response(status_code=403)
-    status = signing.verify(uri)
-    return Response(STATUS_TEXT.get(status), status_code=status)
+def _annotations(title: str, *, read_only: bool, destructive: bool = False) -> mt.ToolAnnotations:
+    return mt.ToolAnnotations(title=title, read_only_hint=read_only, destructive_hint=destructive)
 
 
-async def page(request: Request) -> Response:
-    """Caddy asks which blob to serve for /<name>/ on the pages host; it gets it in X-Blob."""
-    if request.headers.get("x-forwarded-method", "GET") not in ("GET", "HEAD"):
-        return Response(status_code=405)
-    blob = await anyio.to_thread.run_sync(pages.blob_for, request.headers.get("x-forwarded-uri", ""))
-    return Response(headers={"X-Blob": blob}) if blob else PlainTextResponse("no such page\n", status_code=404)
+@vault.tool(annotations=_annotations("Execute SQL query or statement", read_only=False, destructive=True))
+async def sql(
+    query: str,
+    params: list[Any] | dict[str, Any] | None = None,
+    limit: int = 100,
+    cursor: str | None = None,
+) -> dict[str, Any]:
+    """Run one SQL query or write statement against vault.db (5s timeout, 100-row cap, cursor pagination)."""
+    return await anyio.to_thread.run_sync(
+        lambda: store.run_sql(
+            config.DB_PATH,
+            query,
+            params=params,
+            limit=limit,
+            cursor=cursor,
+            vec_db_path=config.vec_db_path(),
+        )
+    )
 
 
-async def gallery(_: Request) -> HTMLResponse:
-    return HTMLResponse(await anyio.to_thread.run_sync(pages.gallery))
+@vault.tool(annotations=_annotations("Retrieve Working Memory Packet", read_only=True))
+async def recall(query: str, budget: int = 1800, limit: int = 6) -> dict[str, Any]:
+    """Retrieve relevant items, 1-hop context links, armed cues, and recent episodes within token budget."""
+    return await anyio.to_thread.run_sync(
+        lambda: store.recall(
+            config.DB_PATH,
+            query,
+            budget=budget,
+            k=limit,
+            vec_db_path=config.vec_db_path(),
+        )
+    )
 
 
-async def put_file(request: Request) -> Response:
-    """One file of an upload ticket, streamed to disk and filed before the response."""
-    raw = request.scope["raw_path"].decode("latin-1") + "?" + request.scope["query_string"].decode("latin-1")
-    status = signing.verify(raw)
-    if status != 200:
-        return PlainTextResponse(STATUS_TEXT[status], status_code=status)
-    ticket = incoming.ticket(request.path_params["ticket"])
-    if ticket is None:
-        return PlainTextResponse("upload ticket expired\n", status_code=410)
-    length = int(request.headers.get("content-length") or 0)
-    if length > config.UPLOAD_MAX_BYTES:
-        return PlainTextResponse(f"larger than {config.UPLOAD_MAX_BYTES // 1024**2} MB\n", status_code=413)
-    try:
-        part = await incoming.receive(request.stream(), config.UPLOAD_MAX_BYTES)
-    except documents.DocumentError as e:
-        return PlainTextResponse(f"{e}\n", status_code=413)
-    name = documents.safe_name(urllib.parse.unquote(request.path_params["name"]))
-    try:
-        result = await anyio.to_thread.run_sync(partial(
-            filing.file, part, original_name=name, origin=filing.origin_of(ticket["client"]),
-            added_by=ticket["client"], purpose=ticket["purpose"], tags=ticket["tags"], replaces=ticket.get("replaces")))
-    except documents.DocumentError as e:
-        return PlainTextResponse(f"{e}\n", status_code=409)
-    finally:
-        part.unlink(missing_ok=True)
-    answer = {"note": result["note"], "duplicate": result["duplicate"]}
-    if view := pages.view_url(result["note"]):
-        answer["view_url"] = view
-    return JSONResponse(answer, status_code=200 if result["duplicate"] else 201)
+@vault.tool(annotations=_annotations("Read/write raw vault files", read_only=False, destructive=True))
+async def file(
+    action: str,
+    path: str = "",
+    content: str = "",
+    content_base64: str = "",
+    ext: str = "",
+    offset: int = 0,
+    limit: int = files.DEFAULT_READ_LIMIT,
+) -> dict[str, Any]:
+    """Operate strictly inside $VAULT_ROOT: action in read | write | put_blob | delete."""
+    if action == "read":
+        return await anyio.to_thread.run_sync(
+            lambda: files.read_file(config.VAULT_ROOT, path, offset=offset, limit=limit)
+        )
+    if action == "write":
+        res = await anyio.to_thread.run_sync(lambda: files.write_file(config.VAULT_ROOT, path, content))
+        rel = str(res["path"])
+        if rel.startswith("usr/views/") and rel.endswith(".sql"):
+            await anyio.to_thread.run_sync(lambda: store.reload_views(config.DB_PATH, config.VIEWS_DIR))
+        return res
+    if action == "put_blob":
+        data = base64.b64decode("".join(content_base64.split()), validate=True)
+        return await anyio.to_thread.run_sync(lambda: files.put_blob(config.VAULT_ROOT, data, ext=ext))
+    if action == "delete":
+        res = await anyio.to_thread.run_sync(lambda: files.delete_file(config.VAULT_ROOT, path))
+        rel = str(res["path"])
+        if rel.startswith("usr/views/") and rel.endswith(".sql"):
+            await anyio.to_thread.run_sync(lambda: store.reload_views(config.DB_PATH, config.VIEWS_DIR))
+        return res
+    raise ValueError(f"unsupported file action: {action}")
+
+
+@vault.resource("vault://schema")
+def resource_schema() -> str:
+    """Canonical SQL schema and vector index DDL."""
+    return store.schema_text()
+
+
+@vault.resource("vault://views")
+async def resource_views() -> str:
+    """Currently active SQL view definitions."""
+    return await anyio.to_thread.run_sync(lambda: store.views_text(config.DB_PATH))
 
 
 async def healthz(_: Request) -> PlainTextResponse:
-    with store.connect() as conn:
-        ok = conn.execute("SELECT 1 FROM pages WHERE id = 'AGENTS'").fetchone() is not None
-    return PlainTextResponse("ok\n" if ok else "vault empty\n", status_code=200 if ok else 503)
+    def _check() -> bool:
+        with contextlib.closing(store.connect(config.DB_PATH)) as conn:
+            return (
+                conn.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='items'").fetchone()
+                is not None
+            )
+
+    ok = await anyio.to_thread.run_sync(_check)
+    return PlainTextResponse("ok\n" if ok else "vault not initialized\n", status_code=200 if ok else 503)
 
 
 def build() -> FastMCP:
+    """Construct the configured FastMCP server."""
     server = FastMCP("vault", instructions=INSTRUCTIONS, auth=build_auth(), middleware=[Gatekeeper()])
     server.mount(vault)
-    server.custom_route("/_verify", methods=["GET", "HEAD"])(verify)
-    server.custom_route("/_page", methods=["GET", "HEAD"])(page)
-    server.custom_route("/_pages", methods=["GET"])(gallery)
-    server.custom_route("/u/{ticket}/{name}", methods=["PUT"])(put_file)
     server.custom_route("/healthz", methods=["GET"])(healthz)
     return server
 
 
+def _startup_sync() -> None:
+    try:
+        embed.query("warm up")
+        synced = store.sync_vectors(config.DB_PATH, vec_db_path=config.vec_db_path())
+        log.info("background vector warmup complete (%d rows synced)", synced)
+    except Exception:
+        log.exception("background vector warmup failed")
+
+
 def main() -> None:
-    threading.Thread(target=embed.query, args=("warm up",), daemon=True).start()  # load the model before a search
+    store.init_db(config.DB_PATH, views_dir=config.VIEWS_DIR, vec_db_path=config.vec_db_path())
+    threading.Thread(target=_startup_sync, daemon=True).start()
     if config.METRICS_PORT:
-        start_http_server(config.METRICS_PORT)  # its own port, never published
+        start_http_server(config.METRICS_PORT)
     build().run(transport="http", host="0.0.0.0", port=config.PORT, path="/mcp")
